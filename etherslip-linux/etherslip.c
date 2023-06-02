@@ -80,60 +80,17 @@ int ser_socket;
 int eth_socket;
 
 
-size_t ip_header_padded_size(size_t raw_size) {
-  return (raw_size + 3) & ~3;
-}
-
-
-size_t compute_ip_header_size(void const * frame) {
-  struct iphdr const * ip_header = (struct iphdr const *)frame;
-  size_t size = ip_header->tot_len;
-  
-  if (size < sizeof (struct iphdr)) {
-    return 0;
-  }
-  
-  size_t max_options_size = size - sizeof (struct iphdr);
-  if (max_options_size > (64 - sizeof (struct iphdr))) {
-    max_options_size = 64 - sizeof (struct iphdr);
-  }
-  
-  uint8_t const * options_buf =
-    (uint8_t const *)frame + sizeof (struct iphdr);
-  size_t options_size = 0;
-  while (options_buf[options_size] != 0) {
-    size_t size = options_buf[options_size + 1];
-    if (options_size + 1 + size + 1 > max_options_size) {
-      // badly formed options
-      return 0;
-    }
-  }
-  ++options_size;
-  return ip_header_padded_size(sizeof (struct iphdr) + options_size);
-}
-
-
 uint16_t ip_header_checksum(void const * frame, size_t header_size) {
   uint8_t const * const buf = (uint8_t const *)frame;
   uint32_t checksum = 0;
   
-  for (size_t i = 0; i + 1 < header_size; i += 2) {
-    checksum += ntohs(*(uint16_t const *)(buf + i));
+  for (size_t i = 0; i < header_size / 2; ++i) {
+    checksum += ntohs(((uint16_t const *)buf)[i]);
   }
 
-  return ~((checksum >> 16) + (checksum & 0xFFFF));
-}
-
-
-bool validate_ip_header(void const * frame) {
-  size_t header_size = compute_ip_header_size(frame);
-  if (header_size == 0) {
-    return false;
-  }
-  if (ip_header_checksum(frame, header_size) != 0) {
-    return false;
-  }
-  return true;
+  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
+  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
+  return ~checksum & 0xFFFF;
 }
 
 
@@ -141,13 +98,13 @@ bool validate_ip_frame(void const * eth_frame, size_t eth_size) {
   uint8_t const * buf = (uint8_t const *)eth_frame;
   struct ethhdr const * eth_header = (struct ethhdr const *)eth_frame;
   
-  printf("dest address: ");
+  printf("dest: ");
   for (size_t i = 0; i < ETH_ALEN; ++i) {
     if (i > 0) printf(":");
     printf("%02X", (int)eth_header->h_dest[i]);
   }
   
-  printf(", source address: ");
+  printf(", src: ");
   for (size_t i = 0; i < ETH_ALEN; ++i) {
     if (i > 0) printf(":");
     printf("%02X", (int)eth_header->h_source[i]);
@@ -155,23 +112,46 @@ bool validate_ip_frame(void const * eth_frame, size_t eth_size) {
   
   uint16_t proto = ntohs(eth_header->h_proto);
   size_t size = 0;
+  printf(", proto: 0x%X, eth_size:%lu\n", (unsigned)proto,
+    (unsigned long)eth_size);
   
   if (proto < ETH_P_802_3_MIN) {
     size = 0;
     proto = ETH_P_802_3;
   } else if ((proto == ETH_P_IP)
       && (eth_size >= sizeof (struct ethhdr) + sizeof (struct iphdr))) {
+    // The order of these tests is important -- some of them depend on prior
+    // tests passing to be safe, e.g. checking the header checksum after
+    // verifying that the received packet isn't truncated
     struct iphdr const * header =
       (struct iphdr const *)(buf + sizeof (struct ethhdr));
-    size = ntohs(header->tot_len);
-    if ((size > eth_size - sizeof (struct ethhdr))
-        || !validate_ip_header(header)) {
-      size = 0;
+    if (header->version != 4) {
+      printf("  bad version\n");
+      return false;
     }
+    size_t header_size = header->ihl * 4;
+    if (header_size < sizeof (struct iphdr)) {
+      printf("  bad header size\n");
+      return false;
+    }
+    if (eth_size < sizeof (struct ethhdr) + header_size) {
+      printf("  truncated header\n");
+      return false;
+    }
+    uint16_t checksum = ip_header_checksum(header, header_size);
+    if (checksum != 0) {
+      printf("  bad header checksum\n");
+      return false;
+    }
+    size = ntohs(header->tot_len);
+    if (eth_size < sizeof (struct ethhdr) + size) {
+      printf("  truncated packet\n");
+      return false;
+    }
+    printf("  ip_size: %lu\n", (unsigned long)size);
   } else {
     // nothing
   }
-  printf(", proto: %lX, size: %ld\n", (long)proto, (long)size);
   
   return size > 0;
 }
@@ -183,20 +163,20 @@ void * get_ip_frame(void * eth_frame) {
 }
 
 
-size_t get_ip_frame_size(void * eth_frame) {
-  uint8_t * buf = (uint8_t *)get_ip_frame(eth_frame);
+size_t get_ip_frame_size(void * frame) {
+  uint8_t * buf = (uint8_t *)frame;
   struct iphdr const * header = (struct iphdr const *)buf;
   return ntohs(header->tot_len);
 }
 
 
 uint8_t * get_ip_payload(void * eth_frame, size_t * out_payload_size) {
-  uint8_t * buf = (uint8_t *)get_ip_frame(eth_frame);
-  size_t header_size = compute_ip_header_size(buf);
+  struct iphdr * header = (struct iphdr *)get_ip_frame(eth_frame);
+  size_t header_size = header->ihl * 4;
   if (out_payload_size != NULL) {
-    *out_payload_size = ((struct iphdr const *)buf)->tot_len - header_size;
+    *out_payload_size = ntohs(header->tot_len) - header_size;
   }
-  return buf + header_size;
+  return (uint8_t *)header + header_size;
 }
 
 
@@ -236,7 +216,11 @@ void read_eth(void) {
       }
     } else {
       size_t ip_frame_size = get_ip_frame_size(ip_frame);
-      hex_dump(ip_frame, ip_frame_size);
+      if (ip_frame_size > recv_size) {
+        printf("  bad frame size!\n");
+      } else {
+        hex_dump(ip_frame, ip_frame_size);
+      }
     }
   }
 }

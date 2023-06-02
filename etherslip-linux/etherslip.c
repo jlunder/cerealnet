@@ -6,9 +6,12 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
 #include <netinet/ip.h>
 #include <netinet/if_ether.h>
+#include <netpacket/packet.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -235,6 +238,37 @@ int main(int argc, char * argv[]) {
     exit(1);
   }
   
+  struct ifreq if_ioreq;
+  //char if_name[IFNAMSIZ];
+  struct sockaddr_ll if_mac;
+  
+  memset(&if_mac, 0, sizeof if_mac);
+  
+  memset(&if_ioreq, 0, sizeof if_ioreq);
+  strncpy(if_ioreq.ifr_name, "wlp7s0", IFNAMSIZ - 1);
+  if (ioctl(eth_socket, SIOCGIFINDEX, &if_ioreq) < 0) {
+    perror("get socket index failed");
+    exit(1);
+  }
+  if_mac.sll_ifindex = if_ioreq.ifr_ifindex;
+  
+  memset(&if_ioreq, 0, sizeof if_ioreq);
+  //strncpy(if_ioreq.ifr_name, "wlp7s0", IFNAMSIZ - 1);
+  strncpy(if_ioreq.ifr_name, "enp6s0", IFNAMSIZ - 1);
+  if (ioctl(eth_socket, SIOCGIFHWADDR, &if_ioreq) < 0) {
+    perror("get socket hardware address failed");
+    exit(1);
+  }
+  if_mac.sll_halen = ETH_ALEN;
+  memcpy(if_mac.sll_addr, if_ioreq.ifr_hwaddr.sa_data, ETH_ALEN);
+  printf("%s mac address %02X:%02X:%02X:%02X:%02X:%02X\n", if_ioreq.ifr_name,
+    if_ioreq.ifr_hwaddr.sa_data[0] & 0xFF,
+    if_ioreq.ifr_hwaddr.sa_data[1] & 0xFF,
+    if_ioreq.ifr_hwaddr.sa_data[2] & 0xFF,
+    if_ioreq.ifr_hwaddr.sa_data[3] & 0xFF,
+    if_ioreq.ifr_hwaddr.sa_data[4] & 0xFF,
+    if_ioreq.ifr_hwaddr.sa_data[5] & 0xFF);
+  
   for ( ;; ) {
     /*
     poll_fds[SER_IDX].fd = eth_socket;
@@ -255,15 +289,15 @@ int main(int argc, char * argv[]) {
       exit(1);
     } else if (poll_res == 0) {
       // Nothing ready yet, check again
-      static uint8_t const ping_pkt[] = {
-//        0xD0, 0xDF, 0x9A, 0x09, 0x70, 0xAE, 0x01, 0x02,
-//        0x03, 0x04, 0x05, 0x06, 0x08, 0x00,
+      static uint8_t ping_pkt[] = {
+//        0xD0, 0xDF, 0x9A, 0x09, 0x70, 0xAE,
+        0xB8, 0x70, 0xF4, 0x95, 0xDD, 0x29,
         0xD0, 0xDF, 0x9A, 0x09, 0x70, 0xAE,
-        0xD0, 0xDF, 0x9A, 0x09, 0x70, 0xAE,
+//        0x93, 0x94, 0x95, 0x96, 0x96, 0x98,
         0x08, 0x00,
         0x45, 0x00, 0x00, 0x54, 0x04, 0x13, 0x40, 0x00,
-        0x40, 0x01, 0x08, 0xF3, 0xC0, 0xA8, 0x56, 0xF2,
-        0xC0, 0xA8, 0x56, 0x28, 0x08, 0x00, 0x28, 0x49,
+        0x40, 0x01, 0x08, 0xF3, 0xC0, 0xA8, 0x56, 0x28,
+        0xC0, 0xA8, 0x56, 0x27, 0x08, 0x00, 0x00, 0x00,
         0x81, 0x23, 0x00, 0x01, 0xCE, 0x42, 0x75, 0x64,
         0x00, 0x00, 0x00, 0x00, 0x44, 0x18, 0x08, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x10, 0x11, 0x12, 0x13,
@@ -273,6 +307,18 @@ int main(int argc, char * argv[]) {
         0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33,
         0x34, 0x35, 0x36, 0x37,
       };
+      //memcpy(((struct ethhdr *)ping_pkt)->h_dest, if_mac.sll_addr, ETH_ALEN);
+      memcpy(((struct ethhdr *)ping_pkt)->h_source, if_mac.sll_addr, ETH_ALEN);
+      ((struct iphdr *)(ping_pkt + sizeof (struct ethhdr)))->check = 0;
+      ((struct iphdr *)(ping_pkt + sizeof (struct ethhdr)))->check =
+        ip_header_checksum(ping_pkt + sizeof (struct ethhdr),
+          sizeof (struct iphdr));
+      ((uint16_t *)(ping_pkt + sizeof (struct ethhdr) + sizeof (struct iphdr)))
+        [1] = 0;
+      ((uint16_t *)(ping_pkt + sizeof (struct ethhdr) + sizeof (struct iphdr)))
+        [1] = ip_header_checksum(
+          ping_pkt + sizeof (struct ethhdr) + sizeof (struct iphdr),
+          sizeof ping_pkt - sizeof (struct ethhdr) - sizeof (struct iphdr));
       /*
       printf("  ping_pkt checksum: %04X\n",
         ip_header_checksum(
@@ -280,11 +326,10 @@ int main(int argc, char * argv[]) {
           sizeof ping_pkt - sizeof (struct ethhdr) - sizeof (struct iphdr)));
       */
       printf("sending ping packet\n");
-      struct ether_addr dest_addr = { 0xD0, 0xDF, 0x9A, 0x09, 0x70, 0xAE };
       int send_res =
-//        sendto(eth_socket, ping_pkt, sizeof ping_pkt, MSG_DONTWAIT,
-//          (struct sockaddr const *)&dest_addr, sizeof dest_addr);
-        send(eth_socket, ping_pkt, sizeof ping_pkt, MSG_DONTWAIT);
+        sendto(eth_socket, ping_pkt, sizeof ping_pkt, MSG_DONTWAIT,
+          (struct sockaddr const *)&if_mac, sizeof if_mac);
+//        send(eth_socket, ping_pkt, sizeof ping_pkt, MSG_DONTWAIT);
       if (send_res < 0) {
         perror("send ping packet failed");
         exit(1);

@@ -207,9 +207,9 @@ void read_eth(void) {
       exit(1);
     }
   } else if ((memcmp(((struct ethhdr const *)packet_buf)->h_dest, &source_mac,
-         ETH_ALEN) != 0)
-     && (memcmp(((struct ethhdr const *)packet_buf)->h_dest, &dest_mac,
-         ETH_ALEN) != 0)) {
+                     ETH_ALEN) != 0) &&
+             (memcmp(((struct ethhdr const *)packet_buf)->h_dest, &dest_mac,
+                     ETH_ALEN) != 0)) {
     // Ignore, wrong dest
   } else if ((recv_size > MAX_PACKET_BUF) ||
              (packet_addr_len > sizeof packet_addr)) {
@@ -364,18 +364,8 @@ void parse_args(int argc, char *argv[]) {
 
   get_device_address(eth_rx_socket, &eth_rx_mac, rx_dev_name);
 
-  struct ifreq ifr;
-  snprintf(ifr.ifr_name, IFNAMSIZ, "%s", rx_dev_name);
-  if (ioctl(eth_rx_socket, SIOCGIFFLAGS, &ifr) < 0) {
-    perror("get rx socket flags failed");
-    exit(1);
-  }
-  ifr.ifr_flags |= IFF_PROMISC;
-  if (ioctl(eth_rx_socket, SIOCSIFFLAGS, &ifr) < 0) {
-    perror("set rx socket flags failed");
-    exit(1);
-  }
-
+#if 0
+  // Bind to specific ethernet device
   if (setsockopt(eth_rx_socket, SOL_SOCKET, SO_BINDTODEVICE, rx_dev_name,
                  IFNAMSIZ - 1) < 0) {
     perror("bind to rx device failed");
@@ -387,6 +377,22 @@ void parse_args(int argc, char *argv[]) {
     perror("bind to tx device failed");
     exit(1);
   }
+#endif
+
+#if 0
+  // Set promiscuous mode
+  struct ifreq ifr;
+  snprintf(ifr.ifr_name, IFNAMSIZ, "%s", rx_dev_name);
+  if (ioctl(eth_rx_socket, SIOCGIFFLAGS, &ifr) < 0) {
+    perror("get rx socket flags failed");
+    exit(1);
+  }
+  ifr.ifr_flags |= IFF_PROMISC;
+  if (ioctl(eth_rx_socket, SIOCSIFFLAGS, &ifr) < 0) {
+    perror("set rx socket flags failed");
+    exit(1);
+  }
+#endif
 
   if (!force_source_mac) {
     memcpy(&source_mac, eth_tx_mac.sll_addr, ETH_ALEN);
@@ -461,7 +467,7 @@ int main(int argc, char *argv[]) {
     poll_fds[ETH_IDX].events = POLLIN;
     poll_fds[ETH_IDX].revents = 0;
 
-    printf("Waiting for packet\n");
+    // printf("Waiting for packet\n");
 
     int poll_res = poll(poll_fds, 1, 1000);
 
@@ -480,7 +486,8 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &cur_time);
     int64_t dmsec =
         ((cur_time.tv_sec - last_keepalive_time.tv_sec) * 1000000000LL +
-        (cur_time.tv_nsec - last_keepalive_time.tv_nsec)) / 1000000LL;
+         (cur_time.tv_nsec - last_keepalive_time.tv_nsec)) /
+        1000000LL;
 
     if (dmsec > 2000) {
       last_keepalive_time = cur_time;

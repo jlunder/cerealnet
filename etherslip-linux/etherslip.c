@@ -88,6 +88,11 @@ int eth_rx_socket;
 struct sockaddr_ll eth_tx_mac;
 struct sockaddr_ll eth_rx_mac;
 
+struct ether_addr source_mac;
+struct ether_addr dest_mac;
+struct in_addr source_ip;
+struct in_addr dest_ip;
+
 uint16_t ip_header_checksum(void const *frame, size_t header_size) {
   uint8_t const *const buf = (uint8_t const *)frame;
   uint32_t checksum = 0;
@@ -201,6 +206,11 @@ void read_eth(void) {
       perror("recvfrom failed");
       exit(1);
     }
+  } else if ((memcmp(((struct ethhdr const *)packet_buf)->h_dest, &source_mac,
+         ETH_ALEN) != 0)
+     && (memcmp(((struct ethhdr const *)packet_buf)->h_dest, &dest_mac,
+         ETH_ALEN) != 0)) {
+    // Ignore, wrong dest
   } else if ((recv_size > MAX_PACKET_BUF) ||
              (packet_addr_len > sizeof packet_addr)) {
     // Ignore packet,it too big
@@ -263,11 +273,6 @@ void get_device_address(int eth_socket, struct sockaddr_ll *eth_mac,
          if_ioreq.ifr_hwaddr.sa_data[4] & 0xFF,
          if_ioreq.ifr_hwaddr.sa_data[5] & 0xFF);
 }
-
-struct ether_addr source_mac;
-struct ether_addr dest_mac;
-struct in_addr source_ip;
-struct in_addr dest_ip;
 
 void print_usage_and_exit(char const *argv0, char const *extra_message,
                           int result) {
@@ -359,17 +364,17 @@ void parse_args(int argc, char *argv[]) {
 
   get_device_address(eth_rx_socket, &eth_rx_mac, rx_dev_name);
 
-  // struct ifreq ifr;
-  // snprintf(ifr.ifr_name, IFNAMSIZ, "%s", rx_dev_name);
-  // if (ioctl(eth_rx_socket, SIOCGIFFLAGS, &ifr) < 0) {
-  //   perror("get rx socket flags failed");
-  //   exit(1);
-  // }
-  // ifr.ifr_flags |= IFF_PROMISC;
-  // if (ioctl(eth_rx_socket, SIOCSIFFLAGS, &ifr) < 0) {
-  //   perror("set rx socket flags failed");
-  //   exit(1);
-  // }
+  struct ifreq ifr;
+  snprintf(ifr.ifr_name, IFNAMSIZ, "%s", rx_dev_name);
+  if (ioctl(eth_rx_socket, SIOCGIFFLAGS, &ifr) < 0) {
+    perror("get rx socket flags failed");
+    exit(1);
+  }
+  ifr.ifr_flags |= IFF_PROMISC;
+  if (ioctl(eth_rx_socket, SIOCSIFFLAGS, &ifr) < 0) {
+    perror("set rx socket flags failed");
+    exit(1);
+  }
 
   if (setsockopt(eth_rx_socket, SOL_SOCKET, SO_BINDTODEVICE, rx_dev_name,
                  IFNAMSIZ - 1) < 0) {
@@ -473,11 +478,11 @@ int main(int argc, char *argv[]) {
 #if 1
     struct timespec cur_time;
     clock_gettime(CLOCK_MONOTONIC, &cur_time);
-    int64_t dnsec =
-        (cur_time.tv_sec - last_keepalive_time.tv_sec) * 1000000000LL +
-        (cur_time.tv_nsec - last_keepalive_time.tv_nsec);
+    int64_t dmsec =
+        ((cur_time.tv_sec - last_keepalive_time.tv_sec) * 1000000000LL +
+        (cur_time.tv_nsec - last_keepalive_time.tv_nsec)) / 1000000LL;
 
-    if (dnsec > 250000000LL) {
+    if (dmsec > 2000) {
       last_keepalive_time = cur_time;
 
       printf("sending ping packet\n");

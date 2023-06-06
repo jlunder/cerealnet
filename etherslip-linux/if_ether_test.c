@@ -81,7 +81,6 @@ size_t ser_recv_so_far = 0;
 struct pollfd poll_fds[FDS_SIZE];
 struct timespec timeout = {1, 0};
 
-int ser_socket;
 int eth_tx_socket;
 int eth_rx_socket;
 

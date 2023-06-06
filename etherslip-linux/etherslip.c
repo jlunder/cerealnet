@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <net/if.h>
 #include <netinet/ether.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,7 +50,7 @@ size_t eth_send_tail = 0;
 
 size_t ser_recv_so_far = 0;
 
-int ser_socket;
+int ser_fd;
 int eth_socket;
 
 // the MAC address we're applying to packets bridged from the SLIP interface
@@ -137,8 +139,8 @@ void parse_args(int argc, char *argv[]) {
   //   snprintf(tx_dev_name, sizeof tx_dev_name, "enp0s25");
   // }
 
-  ser_socket = open(ser_dev_name);
-  if (ser_socket < 0) {
+  ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY);
+  if (ser_fd < 0) {
     perror("open() failed for serial socket");
     exit(1);
   }
@@ -151,7 +153,7 @@ void parse_args(int argc, char *argv[]) {
   }
 
   if (!force_eth_mac && strlen(eth_dev_name) > 0) {
-    get_device_address(eth_socket, &eth_mac, eth_dev_name);
+    eth_get_hwaddr(eth_socket, eth_dev_name, &eth_mac);
   }
 }
 
@@ -171,7 +173,7 @@ void poll_loop(void) {
   clock_gettime(CLOCK_MONOTONIC, &last_keepalive_time);
 
   for (;;) {
-    poll_fds[SER_IDX].fd = ser_socket;
+    poll_fds[SER_IDX].fd = ser_fd;
     poll_fds[SER_IDX].events = POLLIN;
     poll_fds[SER_IDX].revents = 0;
 
@@ -277,7 +279,7 @@ void eth_read_available(void) {
     void *ip_frame = get_ip_frame(packet_buf);
     if (ip_frame == NULL) {
       logf("  packet badly formed (%lu bytes):\n", (unsigned long)recv_size);
-      hex_dump(packet_buf, recv_size > 64 ? 64 : (size_t)recv_size);
+      //hex_dump(packet_buf, recv_size > 64 ? 64 : (size_t)recv_size);
       if (recv_size > 64) {
         logf("  ...\n");
       }
@@ -289,7 +291,7 @@ void eth_read_available(void) {
         if (ip_frame_size + sizeof(struct ethhdr) < recv_size) {
           logf("  runt IP frame!\n");
         }
-        hex_dump(ip_frame, ip_frame_size > 64 ? 64 : (size_t)ip_frame_size);
+        //hex_dump(ip_frame, ip_frame_size > 64 ? 64 : (size_t)ip_frame_size);
         if (ip_frame_size > 64) {
           logf("  ...\n");
         }

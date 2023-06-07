@@ -68,7 +68,7 @@ struct arp_msg {
                  // 8=InARP req, rep
   uint8_t addrs[255 * 4];
   // sha, spa, tha, tpa
-};
+} __attribute__((packed));
 
 struct ip_packet {
   union {
@@ -80,20 +80,20 @@ struct ip_packet {
         struct dhcp_msg dhcp;
         struct arp_msg arp;
       };
-    };
+    } __attribute__((packed));
     uint8_t ip_raw[MAX_PACKET_SIZE - sizeof(struct ethhdr)];
   };
-};
+} __attribute__((packed));
 
 struct eth_packet {
   union {
     struct {
       struct ethhdr hdr;
       struct ip_packet ip;
-    };
+    } __attribute__((packed));
     uint8_t eth_raw[MAX_PACKET_SIZE];
   };
-};
+} __attribute__((packed));
 
 // Round up to align to 16 bytes
 #define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
@@ -269,7 +269,7 @@ void poll_loop(void) {
     poll_fds[ETH_IDX].events = POLLIN;
     poll_fds[ETH_IDX].revents = 0;
 
-    int poll_res = poll(poll_fds, 1, 100);
+    int poll_res = poll(poll_fds, FDS_SIZE, 100);
 
     if (poll_res < 0) {
       perror("poll failed");
@@ -285,25 +285,25 @@ void poll_loop(void) {
         1000000LL;
     bool keepalive = false;
 
-    if (dmsec > 10000) {
-      last_keepalive_time.tv_sec += 10;
+    if (dmsec > 2000) {
+      last_keepalive_time.tv_sec += 2;
       keepalive = true;
     }
 #endif
 
-    if (keepalive || (poll_res > 0)) {
+    if (keepalive) {
       logf("%lu: alive (%d)\n",
            cur_time.tv_sec * 1000LU + cur_time.tv_nsec / 1000000LU, poll_res);
     }
     if (poll_res > 0) {
       // Data available somewhere!
-      if ((poll_fds[SER_IDX].revents & ~POLLIN) != 0) {
-        int re = poll_fds[SER_IDX].revents;
-        logf("While polling ethernet interface: %d ( %s%s%s)", re,
-             (re & POLLERR) != 0 ? "ERR " : "",
-             (re & POLLHUP) != 0 ? "HUP " : "",
-             (re & POLLNVAL) != 0 ? "INVAL " : "");
-      }
+      // if ((poll_fds[SER_IDX].revents & ~POLLIN) != 0) {
+      //   int re = poll_fds[SER_IDX].revents;
+      //   logf("While polling ethernet interface: %d ( %s%s%s)", re,
+      //        (re & POLLERR) != 0 ? "ERR " : "",
+      //        (re & POLLHUP) != 0 ? "HUP " : "",
+      //        (re & POLLNVAL) != 0 ? "INVAL " : "");
+      // }
 
       if ((poll_fds[ETH_IDX].revents & ~POLLIN) != 0) {
         int re = poll_fds[ETH_IDX].revents;
@@ -313,9 +313,9 @@ void poll_loop(void) {
              (re & POLLNVAL) != 0 ? "INVAL " : "");
       }
 
-      if ((poll_fds[SER_IDX].revents & POLLIN) != 0) {
-        ser_read_available();
-      }
+      // if ((poll_fds[SER_IDX].revents & POLLIN) != 0) {
+      //   ser_read_available();
+      // }
       if ((poll_fds[ETH_IDX].revents & POLLIN) != 0) {
         eth_read_available();
       }
@@ -345,7 +345,7 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
           ser_read_accum.ip.ip_raw[used++] = SLIP_END;
           break;
         case SLIP_ESC_ESC:
-          ser_read_accum.ip.ip_raw[used++] = SLIP_END;
+          ser_read_accum.ip.ip_raw[used++] = SLIP_ESC;
           break;
         // If "c" is not one of these two, then we have a protocol violation.
         // The best bet seems to be to leave the byte alone and just stuff it
@@ -390,12 +390,13 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
         if (!validate_ip_frame(&ser_read_accum.ip, used)) {
           // Ignore packet, not valid IP
           logf("ser packet not valid ip (%lu bytes):\n", (unsigned long)used);
-          size_t ext_size = sizeof(struct ethhdr) + used;
-          hex_dump(stdlog, ser_read_accum.eth_raw,
-                   ext_size > 64 ? 64 : ext_size);
-          if (ext_size > 64) {
-            logf("  ...\n");
-          }
+          hex_dump(stdlog, ser_read_accum.ip.ip_raw, used);
+          // size_t ext_size = sizeof(struct ethhdr) + used;
+          // hex_dump(stdlog, ser_read_accum.eth_raw,
+          //          ext_size > 64 ? 64 : ext_size);
+          // if (ext_size > 64) {
+          //   logf("  ...\n");
+          // }
         } else {
           ser_process(&ser_read_accum.ip);
         }
@@ -422,7 +423,7 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
 
 void ser_process(struct ip_packet *ip_frame) {
   // TODO implement
-  logf("received SLIP packet:");
+  logf("received SLIP packet:\n");
   hex_dump(stdlog, ip_frame->ip_raw, ntohs(ip_frame->hdr.tot_len));
 }
 
@@ -439,7 +440,10 @@ bool ser_process_arp_response(struct ip_packet *ip_frame) {
 }
 
 void ser_send(struct ip_packet const *ip_frame) {
-  assert(ser_write_buf_tail == ser_write_buf_head);
+  assert(ser_write_buf_head == 0);
+
+  logf("ser_send packet:\n");
+  hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
 
   assert(validate_ip_frame(ip_frame, sizeof *ip_frame));
   size_t size = ntohs(ip_frame->hdr.tot_len);
@@ -459,6 +463,7 @@ void ser_send(struct ip_packet const *ip_frame) {
         assert(j + 2 <= SER_BUF_SIZE);
         ser_write_buf[j++] = SLIP_ESC;
         ser_write_buf[j++] = SLIP_ESC_END;
+        ++i;
       } break;
 
       // If it's the same code as an ESC character, we send a special two
@@ -467,6 +472,7 @@ void ser_send(struct ip_packet const *ip_frame) {
         assert(j + 2 <= SER_BUF_SIZE);
         ser_write_buf[j++] = SLIP_ESC;
         ser_write_buf[j++] = SLIP_ESC_ESC;
+        ++i;
       } break;
 
       // Otherwise, we just send the character
@@ -525,6 +531,7 @@ void eth_read_available(void) {
   // at reading/processing a single packet
   struct eth_packet *eth_frame = alloc_packet_buf();
   if (eth_frame == NULL) {
+    logf("eth packet alloc failed!\n");
     return;
   }
 
@@ -557,16 +564,16 @@ void eth_read_available(void) {
          (unsigned long)(sizeof packet_addr), (unsigned long)recv_size);
   } else if (!validate_eth_ip_frame(eth_frame, (size_t)recv_size)) {
     // Ignore packet, not valid IP
-    logf("eth packet not valid ip (%lu bytes):\n", (unsigned long)recv_size);
-    hex_dump(stdlog, eth_frame, recv_size > 64 ? 64 : (size_t)recv_size);
-    if (recv_size > 64) {
-      logf("  ...\n");
-    }
+    // logf("eth packet not valid ip (%lu bytes):\n", (unsigned long)recv_size);
+    // hex_dump(stdlog, eth_frame, recv_size > 64 ? 64 : (size_t)recv_size);
+    // if (recv_size > 64) {
+    //   logf("  ...\n");
+    // }
   } else {
     // A complete packet!
     eth_process_frame(eth_frame);
-    free_packet_buf(eth_frame);
   }
+  free_packet_buf(eth_frame);
 }
 
 void eth_process_frame(struct eth_packet *eth_frame) {

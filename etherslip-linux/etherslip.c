@@ -189,27 +189,46 @@ void parse_args(int argc, char *argv[]) {
 
   int opt;
   int res;
-  while ((opt = getopt(argc, argv, "s:e:m:Mh")) != -1) {
+  while ((opt = getopt(argc, argv, "s:e:m:MhT")) != -1) {
     switch (opt) {
-      case 'm':
+      case 'm': {
         force_eth_mac = true;
         if ((tmp_mac = ether_aton(optarg)) == NULL) {
           print_usage_and_exit(argv[0], "Bad arg: expected MAC address", 1);
         }
         memcpy(&eth_mac, tmp_mac, sizeof(struct ether_addr));
-        break;
-      case 's':
+      } break;
+      case 's': {
         snprintf(ser_dev_name, PATH_MAX, "%s", optarg);
-        break;
-      case 'e':
+      } break;
+      case 'e': {
         snprintf(eth_dev_name, IFNAMSIZ, "%s", optarg);
-        break;
-      case 'h':
+      } break;
+      case 'T': {
+        struct ip_packet pkt;
+        pkt.hdr.version = 4;
+        pkt.hdr.ihl = 5;
+        pkt.hdr.tos = 0x00;
+        pkt.hdr.tot_len = htons(offsetof(struct ip_packet, ip_payload[256]));
+        pkt.hdr.frag_off = htons(0);
+        pkt.hdr.ttl = 0x40;
+        pkt.hdr.id = 0x01;
+        pkt.hdr.check = 0;
+        pkt.hdr.daddr = inet_addr("192.168.86.255");
+        pkt.hdr.saddr = inet_addr("192.168.86.43");
+        for (size_t i = 0; i < 256; ++i) {
+          pkt.ip_payload[i] = (uint8_t)i;
+        }
+        pkt.hdr.check = ip_header_checksum(&pkt, pkt.hdr.ihl * 4);
+        ser_send(&pkt);
+        exit(0);
+      } break;
+      case 'h': {
         print_usage_and_exit(argv[0], NULL, 0);
-        break;
-      default:
+      } break;
+      default: {
         print_usage_and_exit(argv[0], "Invalid option", 1);
-        break;
+      } break;
     }
   }
 
@@ -341,18 +360,18 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
       uint8_t c = data[i++];
       assert(used < sizeof ser_read_accum.ip.ip_raw);
       switch (c) {
-        case SLIP_ESC_END:
+        case SLIP_ESC_END: {
           ser_read_accum.ip.ip_raw[used++] = SLIP_END;
-          break;
-        case SLIP_ESC_ESC:
+        } break;
+        case SLIP_ESC_ESC: {
           ser_read_accum.ip.ip_raw[used++] = SLIP_ESC;
-          break;
+        } break;
         // If "c" is not one of these two, then we have a protocol violation.
         // The best bet seems to be to leave the byte alone and just stuff it
         // into the packet.
-        default:
+        default: {
           ser_read_accum.ip.ip_raw[used++] = c;
-          break;
+        } break;
       }
       esc = false;
       // Stop if we've emptied the input buffer
@@ -386,8 +405,11 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
     // Handle bytestuffing if necessary
     switch (c) {
       // If it's an END character then we're done with the packet
-      case SLIP_END:
-        if (!validate_ip_frame(&ser_read_accum.ip, used)) {
+      case SLIP_END: {
+        if (used == 0) {
+          // Ignore silently, probably just a spacer put in by the client to
+          // increase noise resistance
+        } else if (!validate_ip_frame(&ser_read_accum.ip, used)) {
           // Ignore packet, not valid IP
           logf("ser packet not valid ip (%lu bytes):\n", (unsigned long)used);
           hex_dump(stdlog, ser_read_accum.ip.ip_raw, used);
@@ -402,17 +424,17 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
         }
         // Packet has either been discarded or processed, start a new one
         used = 0;
-        break;
+      } break;
       // If it's the same code as an ESC character, wait and get another
       // character and then figure out what to store in the packet based on
       // that.
-      case SLIP_ESC:
+      case SLIP_ESC: {
         esc = true;
-        break;
+      } break;
       // There shouldn't be anything but special characters if we got in here?
-      default:
+      default: {
         assert(!"Should have been handled as a non-special character");
-        break;
+      } break;
     }
   }
 
@@ -486,7 +508,7 @@ void ser_send(struct ip_packet const *ip_frame) {
         }
         size_t amount = k - i;
         assert(j + amount <= SER_BUF_SIZE);
-        memcpy(ser_write_buf + i, ip_frame->ip_raw + i, amount);
+        memcpy(ser_write_buf + j, ip_frame->ip_raw + i, amount);
         i = k;
         j += amount;
       } break;
@@ -498,6 +520,8 @@ void ser_send(struct ip_packet const *ip_frame) {
   ser_write_buf_tail = 0;
   ser_write_buf_head = j;
 
+  logf("SLIP encoded:\n");
+  hex_dump(stdlog, ser_write_buf, j);
   ser_try_write_pending();
 }
 

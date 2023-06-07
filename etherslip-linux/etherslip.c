@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -23,16 +24,22 @@
 #include <time.h>
 #include <unistd.h>
 
-#define logf(...) fprintf(stderr, __VA_ARGS__)
+#define stdlog stderr
+#define logf(...) fprintf(stdlog, __VA_ARGS__)
 
-#define MAX_PACKET_BUF 16384
-#define BUF_POOL_SIZE 6
-#define SLIP_SEND_QUEUE_SIZE 2
-#define ETH_SEND_QUEUE_SIZE 2
+#define MAX_PACKET_SIZE (1024 * 10) /* big enough for a 9k jumbo frame */
+#define PACKET_POOL_SIZE 6
 
 #define SER_IDX 0
 #define ETH_IDX 1
 #define FDS_SIZE 2
+
+// SLIP implementation adapted from sample code in RFC 1055
+// SLIP special character codes
+#define SLIP_END 0300     /* indicates end of packet */
+#define SLIP_ESC 0333     /* indicates byte stuffing */
+#define SLIP_ESC_END 0334 /* ESC ESC_END means END data byte */
+#define SLIP_ESC_ESC 0335 /* ESC ESC_ESC means ESC data byte */
 
 struct dhcp_msg {
   uint8_t op;
@@ -63,196 +70,52 @@ struct arp_msg {
   // sha, spa, tha, tpa
 };
 
-struct packet {
+struct ip_packet {
   union {
     struct {
-      struct ethhdr eth;
-      struct iphdr ip;
+      struct iphdr hdr;
       union {
+        uint8_t ip_payload[MAX_PACKET_SIZE - sizeof(struct iphdr) -
+                           sizeof(struct ethhdr)];
         struct dhcp_msg dhcp;
         struct arp_msg arp;
       };
     };
-    uint8_t raw[MAX_PACKET_BUF];
+    uint8_t ip_raw[MAX_PACKET_SIZE - sizeof(struct ethhdr)];
   };
 };
 
-// Adapted from sample code in RFC 1055
+struct eth_packet {
+  union {
+    struct {
+      struct ethhdr hdr;
+      struct ip_packet ip;
+    };
+    uint8_t eth_raw[MAX_PACKET_SIZE];
+  };
+};
 
-// SLIP special character codes
-#define SLIP_END 0300     /* indicates end of packet */
-#define SLIP_ESC 0333     /* indicates byte stuffing */
-#define SLIP_ESC_END 0334 /* ESC ESC_END means END data byte */
-#define SLIP_ESC_ESC 0335 /* ESC ESC_ESC means ESC data byte */
+// Round up to align to 16 bytes
+#define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
+#define SER_BUF_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
 
-void send_char(uint8_t c) {}
-uint8_t recv_char(void) { return SLIP_END; }
+struct eth_packet packet_pool[PACKET_POOL_SIZE];
+struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
+size_t packet_pool_unallocated_count = 0;
 
-// slip_send_packet: sends a packet of length "len", starting at location "p".
-void slip_send_packet(uint8_t *p, size_t len) {
-  // Send an initial END character to flush out any data that may have
-  // accumulated in the receiver due to line noise
-  send_char(SLIP_END);
+struct eth_packet ser_read_accum;
+size_t ser_read_accum_used = 0;
+bool ser_read_accum_esc = false;
 
-  // For each byte in the packet, send the appropriate character sequence
-  while (len--) {
-    switch (*p) {
-      // If it's the same code as an END character, we send a special two
-      // character code so as not to make the receiver think we sent an END
-      case SLIP_END:
-        send_char(SLIP_ESC);
-        send_char(SLIP_ESC_END);
-        break;
+uint8_t ser_write_buf[SER_BUF_SIZE];
+size_t ser_write_buf_head = 0;
+size_t ser_write_buf_tail = 0;
 
-#ifndef TIGHTER_SLIP
-      // If it's the same code as an ESC character, we send a special two
-      // character code so as not to make the receiver think we sent an ESC
-      case SLIP_ESC:
-        send_char(SLIP_ESC);
-        send_char(SLIP_ESC_ESC);
-        break;
-#else
-      case SLIP_ESC:
-        // If it's the same code as an ESC character, we send a special two
-        // character code so as not to make the receiver think we sent an ESC
-        if (!len || (p[1] == SLIP_ESC_END) || (p[1] == SLIP_ESC_ESC)) {
-          send_char(SLIP_ESC);
-          send_char(SLIP_ESC_ESC);
-        } else {
-          len--;
-          p++;
-          send_char(SLIP_ESC);
-          send_char(*p);
-        }
-        break;
-#endif
-      // Otherwise, we just send the character
-      default:
-        send_char(*p);
-    }
-
-    p++;
-  }
-
-  /* tell the receiver that we're done sending the packet
-   */
-  send_char(SLIP_END);
-}
-
-// slip_recv_packet: receives a packet into the buffer located at "p".
-// If more than len bytes are received, the packet will be truncated. Returns
-// the number of bytes stored in the buffer.
-size_t slip_recv_packet(uint8_t *p, size_t len) {
-  char c;
-  size_t received = 0;
-
-  // Sit in a loop reading bytes until we put together a whole packet. Make sure
-  // not to copy them into the packet if we run out of room.
-  for (;;) {
-    // Get a character to process
-    c = recv_char();
-
-    // Handle bytestuffing if necessary
-    switch (c) {
-      // If it's an END character then we're done with the packet
-      case SLIP_END:
-        // A minor optimization: if there is no data in the packet, ignore it.
-        // This is meant to avoid bothering IP with all the empty packets
-        // generated by the duplicate END characters which are in turn sent to
-        // try to detect line noise.
-        if (received) {
-          return received;
-        } else {
-          break;
-        }
-
-#ifndef TIGHTER_SLIP
-      // If it's the same code as an ESC character, wait and get another
-      // character and then figure out what to store in the packet based on
-      // that.
-      case SLIP_ESC:
-        c = recv_char();
-
-        // If "c" is not one of these two, then we have a protocol violation.
-        // The best bet seems to be to leave the byte alone and just stuff it
-        // into the packet.
-        switch (c) {
-          case SLIP_ESC_END:
-            if (received < len) p[received++] = c;
-            c = SLIP_END;
-            break;
-          case SLIP_ESC_ESC:
-            c = SLIP_ESC;
-            break;
-          default:
-            // Don't change c!
-            break;
-        }
-#else
-      // If it's the same code as an ESC character, wait and get another
-      // character and then figure out what to store in the packet based on
-      // that.
-      case SLIP_ESC:
-        c = recv_char();
-
-        // If "c" is not one of these two, then we have a protocol violation.
-        // The best bet seems to be to leave the byte alone and just stuff it
-        // into the packet.
-
-        // JL: I have a better idea, let's stuff the ESC *and* the following
-        // char, and that way the client can save escaping the escape around
-        // half the time. This decode is compatible with the reference encoder,
-        // and improves stuffing of random packets from ~1% expansion to ~0.5%.
-
-        // What this ends up looking like is:
-        // ESC ESC_ESC -> ESC
-        // ESC ESC_END -> END
-        // ESC_ESC -> ESC_ESC
-        // ESC_END -> ESC_END
-        // ESC ESC -> ESC ESC
-        // ESC x -> ESC x (where x != ESC_END, x != ESC_ESC)
-        // END -> ends packet
-
-        // From the encoding side, in the most efficient coding:
-        // END -> ESC ESC_ESC
-        // ESC ESC_END -> ESC ESC_ESC ESC_END
-        // ESC x -> ESC x (where x != END)
-        // everything else is passed through literally.
-
-        switch (c) {
-          case SLIP_ESC_END:
-            if (received < len) p[received++] = c;
-            c = SLIP_END;
-            break;
-          case SLIP_ESC_ESC:
-            c = SLIP_ESC;
-            break;
-          default:
-            if (received < len) p[received++] = SLIP_ESC;
-            // Don't change c!
-            break;
-        }
-#endif
-      // Here we fall into the default handler and let it store the character
-      // for us
-      default:
-        if (received < len) {
-          p[received++] = c;
-        }
-        break;
-    }
-  }
-}
-
-uint8_t ser_slip_buf[MAX_PACKET_BUF * 2 + 16];
-struct packet ser_send_queue[SLIP_SEND_QUEUE_SIZE];
-struct packet eth_send_queue[ETH_SEND_QUEUE_SIZE];
 size_t ser_send_head = 0;
 size_t ser_send_tail = 0;
+
 size_t eth_send_head = 0;
 size_t eth_send_tail = 0;
-
-size_t ser_recv_so_far = 0;
 
 int ser_fd;
 int eth_socket;
@@ -262,7 +125,7 @@ struct ether_addr eth_mac;
 struct ether_addr broadcast_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // the MAC address the SLIP device uses for itself (only in DHCP packets)
-struct ether_addr ser_dhcp_mac;
+#define ser_dhcp_mac (ser_read_accum.eth.h_source)
 
 void parse_args(int argc, char *argv[]);
 
@@ -274,26 +137,43 @@ void poll_loop(void);
 void ser_read_available(void);
 
 void ser_accumulate_bytes(uint8_t *data, size_t size);
-void ser_process(void *frame);
-bool ser_process_dhcp_request(void *frame);
+void ser_process(struct ip_packet *ip_frame);
+bool ser_process_dhcp_request(struct ip_packet *ip_frame);
+
+void ser_send(struct ip_packet const *ip_frame);
+
+bool ser_try_write_pending(void);
 
 void eth_read_available(void);
 
-bool eth_process_dhcp_response(void *eth_frame);
-bool eth_process_arp_request(void *eth_frame);
+void eth_process_frame(struct eth_packet *eth_frame);
+bool eth_process_dhcp_response(struct eth_packet *eth_frame);
+bool eth_process_arp_request(struct eth_packet *eth_frame);
+
+void eth_send(struct ip_packet *ip_frame);
 
 int eth_get_ifindex(int eth_socket, char const *dev_name);
 void eth_get_hwaddr(int eth_socket, char const *dev_name,
                     struct ether_addr *hwaddr);
 
-uint16_t ip_header_checksum(void const *frame, size_t header_size);
-bool validate_ip_frame(void const *eth_frame, size_t eth_size);
-void *get_ip_frame(void *eth_frame);
-size_t get_ip_frame_size(void *frame);
-uint8_t *get_ip_payload(void *eth_frame, size_t *out_payload_size);
+uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
+                            size_t header_size);
+bool validate_eth_ip_frame(struct eth_packet const *eth_frame, size_t eth_size);
+bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size);
+
+struct eth_packet *alloc_packet_buf(void);
+void free_packet_buf(struct eth_packet *packet);
+
+void hex_dump(FILE *f, void const *buf, size_t size);
 
 int main(int argc, char *argv[]) {
+  for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
+    free_packet_buf(&packet_pool[i]);
+  }
+
   parse_args(argc, argv);
+
+  logf("etherslip starting.\n");
 
   poll_loop();
 
@@ -343,10 +223,14 @@ void parse_args(int argc, char *argv[]) {
   //   snprintf(tx_dev_name, sizeof tx_dev_name, "enp0s25");
   // }
 
-  ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY);
-  if (ser_fd < 0) {
-    perror("open() failed for serial socket");
-    exit(1);
+  if (strlen(ser_dev_name) > 0) {
+    ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY);
+    if (ser_fd < 0) {
+      perror("open() failed for serial socket");
+      exit(1);
+    }
+  } else {
+    ser_fd = -1;
   }
 
   // Create a raw socket
@@ -390,11 +274,6 @@ void poll_loop(void) {
     if (poll_res < 0) {
       perror("poll failed");
       exit(1);
-    } else {
-      if (poll_res == 0) {
-        // Nothing ready yet, check again
-        continue;
-      }
     }
 
 #if 1
@@ -404,32 +283,42 @@ void poll_loop(void) {
         ((cur_time.tv_sec - last_keepalive_time.tv_sec) * 1000000000LL +
          (cur_time.tv_nsec - last_keepalive_time.tv_nsec)) /
         1000000LL;
+    bool keepalive = false;
 
-    if (dmsec > 2000) {
-      last_keepalive_time = cur_time;
+    if (dmsec > 10000) {
+      last_keepalive_time.tv_sec += 10;
+      keepalive = true;
     }
 #endif
 
-    // Data available somewhere!
-    if ((poll_fds[SER_IDX].revents & ~POLLIN) != 0) {
-      int re = poll_fds[SER_IDX].revents;
-      logf("While polling ethernet interface: %d ( %s%s%s)", re,
-           (re & POLLERR) != 0 ? "ERR " : "", (re & POLLHUP) != 0 ? "HUP " : "",
-           (re & POLLNVAL) != 0 ? "INVAL " : "");
+    if (keepalive || (poll_res > 0)) {
+      logf("%lu: alive (%d)\n",
+           cur_time.tv_sec * 1000LU + cur_time.tv_nsec / 1000000LU, poll_res);
     }
+    if (poll_res > 0) {
+      // Data available somewhere!
+      if ((poll_fds[SER_IDX].revents & ~POLLIN) != 0) {
+        int re = poll_fds[SER_IDX].revents;
+        logf("While polling ethernet interface: %d ( %s%s%s)", re,
+             (re & POLLERR) != 0 ? "ERR " : "",
+             (re & POLLHUP) != 0 ? "HUP " : "",
+             (re & POLLNVAL) != 0 ? "INVAL " : "");
+      }
 
-    if ((poll_fds[ETH_IDX].revents & ~POLLIN) != 0) {
-      int re = poll_fds[ETH_IDX].revents;
-      logf("While polling serial interface: %d ( %s%s%s)", re,
-           (re & POLLERR) != 0 ? "ERR " : "", (re & POLLHUP) != 0 ? "HUP " : "",
-           (re & POLLNVAL) != 0 ? "INVAL " : "");
-    }
+      if ((poll_fds[ETH_IDX].revents & ~POLLIN) != 0) {
+        int re = poll_fds[ETH_IDX].revents;
+        logf("While polling serial interface: %d ( %s%s%s)", re,
+             (re & POLLERR) != 0 ? "ERR " : "",
+             (re & POLLHUP) != 0 ? "HUP " : "",
+             (re & POLLNVAL) != 0 ? "INVAL " : "");
+      }
 
-    if ((poll_fds[SER_IDX].revents & POLLIN) != 0) {
-      ser_read_available();
-    }
-    if ((poll_fds[ETH_IDX].revents & POLLIN) != 0) {
-      eth_read_available();
+      if ((poll_fds[SER_IDX].revents & POLLIN) != 0) {
+        ser_read_available();
+      }
+      if ((poll_fds[ETH_IDX].revents & POLLIN) != 0) {
+        eth_read_available();
+      }
     }
   }
 }
@@ -439,27 +328,212 @@ void ser_read_available(void) {
 }
 
 void ser_accumulate_bytes(uint8_t *data, size_t size) {
+  // Cache in local vars
+  size_t used = ser_read_accum_used;
+  bool esc = ser_read_accum_esc;
+
+  // Sit in a loop reading bytes until we put together a whole packet. Make sure
+  // not to copy them into the packet if we run out of room.
+  size_t i = 0;
+  while (i < size) {
+    // If the last character was ESC, apply special processing to this one
+    if (esc) {
+      uint8_t c = data[i++];
+      assert(used < sizeof ser_read_accum.ip.ip_raw);
+      switch (c) {
+        case SLIP_ESC_END:
+          ser_read_accum.ip.ip_raw[used++] = SLIP_END;
+          break;
+        case SLIP_ESC_ESC:
+          ser_read_accum.ip.ip_raw[used++] = SLIP_END;
+          break;
+        // If "c" is not one of these two, then we have a protocol violation.
+        // The best bet seems to be to leave the byte alone and just stuff it
+        // into the packet.
+        default:
+          ser_read_accum.ip.ip_raw[used++] = c;
+          break;
+      }
+      esc = false;
+      // Stop if we've emptied the input buffer
+      if (i >= size) {
+        break;
+      }
+    }
+
+    // Consume as many non-special bytes as possible
+    size_t j = i;
+    while ((j < size) && (data[j] != SLIP_END) && (data[j] != SLIP_ESC)) {
+      ++j;
+    }
+    // Any found?
+    if (j > i) {
+      size_t amount = j - i;
+      assert(used + amount <= sizeof ser_read_accum.ip.ip_raw);
+      // Copy the entire block of non-special bytes at once
+      memcpy(ser_read_accum.ip.ip_raw + used, data + i, amount);
+      used += amount;
+      i = j;
+      // Stop if we've emptied the input buffer
+      if (i >= size) {
+        break;
+      }
+    }
+
+    // Finally, if we've got a special (ESC/END) character, consume/process it
+    assert(i < size);  // Previous consuming clauses should break if empty
+    uint8_t c = data[i++];
+    // Handle bytestuffing if necessary
+    switch (c) {
+      // If it's an END character then we're done with the packet
+      case SLIP_END:
+        if (!validate_ip_frame(&ser_read_accum.ip, used)) {
+          // Ignore packet, not valid IP
+          logf("ser packet not valid ip (%lu bytes):\n", (unsigned long)used);
+          size_t ext_size = sizeof(struct ethhdr) + used;
+          hex_dump(stdlog, ser_read_accum.eth_raw,
+                   ext_size > 64 ? 64 : ext_size);
+          if (ext_size > 64) {
+            logf("  ...\n");
+          }
+        } else {
+          ser_process(&ser_read_accum.ip);
+        }
+        // Packet has either been discarded or processed, start a new one
+        used = 0;
+        break;
+      // If it's the same code as an ESC character, wait and get another
+      // character and then figure out what to store in the packet based on
+      // that.
+      case SLIP_ESC:
+        esc = true;
+        break;
+      // There shouldn't be anything but special characters if we got in here?
+      default:
+        assert(!"Should have been handled as a non-special character");
+        break;
+    }
+  }
+
+  // Commit to statics
+  ser_read_accum_used = used;
+  ser_read_accum_esc = esc;
+}
+
+void ser_process(struct ip_packet *ip_frame) {
+  // TODO implement
+  logf("received SLIP packet:");
+  hex_dump(stdlog, ip_frame->ip_raw, ntohs(ip_frame->hdr.tot_len));
+}
+
+bool ser_process_dhcp_request(struct ip_packet *ip_frame) {
   // TODO implement
 }
 
-void ser_process(void *frame) {
+bool ser_process_arp_request(struct ip_packet *ip_frame) {
   // TODO implement
 }
 
-bool ser_process_dhcp_request(void *frame) {
+bool ser_process_arp_response(struct ip_packet *ip_frame) {
   // TODO implement
-  // first, check if an eth frame is available for the response
+}
+
+void ser_send(struct ip_packet const *ip_frame) {
+  assert(ser_write_buf_tail == ser_write_buf_head);
+
+  assert(validate_ip_frame(ip_frame, sizeof *ip_frame));
+  size_t size = ntohs(ip_frame->hdr.tot_len);
+  // For each byte in the packet, send the appropriate character sequence
+  size_t i = 0;
+  size_t j = 0;
+  assert(j + 1 <= SER_BUF_SIZE);
+  // Send an initial END character to flush out any data that may have
+  // accumulated in the receiver due to line noise
+  ser_write_buf[j++] = SLIP_END;
+  while (i < size) {
+    uint8_t c = ip_frame->ip_raw[i];
+    switch (c) {
+      // If it's the same code as an END character, we send a special two
+      // character code so as not to make the receiver think we sent an END
+      case SLIP_END: {
+        assert(j + 2 <= SER_BUF_SIZE);
+        ser_write_buf[j++] = SLIP_ESC;
+        ser_write_buf[j++] = SLIP_ESC_END;
+      } break;
+
+      // If it's the same code as an ESC character, we send a special two
+      // character code so as not to make the receiver think we sent an ESC
+      case SLIP_ESC: {
+        assert(j + 2 <= SER_BUF_SIZE);
+        ser_write_buf[j++] = SLIP_ESC;
+        ser_write_buf[j++] = SLIP_ESC_ESC;
+      } break;
+
+      // Otherwise, we just send the character
+      default: {
+        size_t k = i + 1;
+        // But also keep looking in case more regular characters can be sent all
+        // at once
+        while ((k < size) && (ip_frame->ip_raw[k] != SLIP_END) &&
+               (ip_frame->ip_raw[k] != SLIP_ESC)) {
+          ++k;
+        }
+        size_t amount = k - i;
+        assert(j + amount <= SER_BUF_SIZE);
+        memcpy(ser_write_buf + i, ip_frame->ip_raw + i, amount);
+        i = k;
+        j += amount;
+      } break;
+    }
+  }
+  assert(j + 1 <= SER_BUF_SIZE);
+  ser_write_buf[j++] = SLIP_END;
+
+  ser_write_buf_tail = 0;
+  ser_write_buf_head = j;
+
+  ser_try_write_pending();
+}
+
+bool ser_try_write_pending(void) {
+  if (ser_write_buf_tail == ser_write_buf_head) {
+    return true;
+  }
+
+  // Write the buffer to the serial port
+  ssize_t amount = ser_write_buf_head - ser_write_buf_tail;
+  ssize_t result = amount;  // write(ser_fd, ser_write_buf + ser_write_buf_tail,
+                            // (size_t)amount);
+  ser_accumulate_bytes(ser_write_buf + ser_write_buf_tail, amount);
+  if (result < 0) {
+    perror("write to ser failed");
+    ser_write_buf_head = 0;
+    ser_write_buf_tail = 0;
+    return true;
+  } else if (result < amount) {
+    ser_write_buf_tail += result;
+    return false;
+  } else {
+    ser_write_buf_head = 0;
+    ser_write_buf_tail = 0;
+    return true;
+  }
 }
 
 void eth_read_available(void) {
   // Try reading the ethernet interface -- despite the name it's okay to stop
   // at reading/processing a single packet
-  uint8_t *packet_buf = ser_send_queue[ser_send_tail].raw;
+  struct eth_packet *eth_frame = alloc_packet_buf();
+  if (eth_frame == NULL) {
+    return;
+  }
+
   struct sockaddr_storage packet_addr;
   socklen_t packet_addr_len = sizeof packet_addr;
   ssize_t recv_size;
 
-  recv_size = recvfrom(eth_socket, packet_buf, MAX_PACKET_BUF, MSG_DONTWAIT,
+  assert(sizeof *eth_frame == MAX_PACKET_SIZE);
+  recv_size = recvfrom(eth_socket, eth_frame, MAX_PACKET_SIZE, MSG_DONTWAIT,
                        (struct sockaddr *)&packet_addr, &packet_addr_len);
   if (recv_size < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
@@ -468,48 +542,43 @@ void eth_read_available(void) {
       perror("recvfrom failed");
       exit(1);
     }
-  } else if ((memcmp(((struct ethhdr const *)packet_buf)->h_dest, &eth_mac,
+  } else if (recv_size < sizeof(struct ethhdr)) {
+    // Runt ethernet frame? Not long enough for MAC??
+    logf("eth packet runt frame (%lu bytes)\n", (unsigned long)recv_size);
+  } else if ((memcmp(((struct ethhdr const *)eth_frame)->h_dest, &eth_mac,
                      ETH_ALEN) != 0) &&
-             (memcmp(((struct ethhdr const *)packet_buf)->h_dest,
-                     &broadcast_mac, ETH_ALEN) != 0)) {
-    // Ignore, wrong dest
-  } else if ((recv_size > MAX_PACKET_BUF) ||
+             (memcmp(((struct ethhdr const *)eth_frame)->h_dest, &broadcast_mac,
+                     ETH_ALEN) != 0)) {
+    // Ignore packet, wrong dest
+  } else if ((recv_size > MAX_PACKET_SIZE) ||
              (packet_addr_len > sizeof packet_addr)) {
-    // Ignore packet,it too big
-    logf("packet too big: %lu/%lu\n", (unsigned long)recv_size,
-         (unsigned long)(sizeof packet_addr));  // packet_addr_len);
-  } else if (validate_ip_frame(packet_buf, (size_t)recv_size)) {
-    // A complete packet!
-    void *ip_frame = get_ip_frame(packet_buf);
-    if (ip_frame == NULL) {
-      logf("  packet badly formed (%lu bytes):\n", (unsigned long)recv_size);
-      // hex_dump(packet_buf, recv_size > 64 ? 64 : (size_t)recv_size);
-      if (recv_size > 64) {
-        logf("  ...\n");
-      }
-    } else {
-      size_t ip_frame_size = get_ip_frame_size(ip_frame);
-      if (ip_frame_size > recv_size) {
-        logf("  bad frame size!\n");
-      } else {
-        if (ip_frame_size + sizeof(struct ethhdr) < recv_size) {
-          logf("  runt IP frame!\n");
-        }
-        // hex_dump(ip_frame, ip_frame_size > 64 ? 64 : (size_t)ip_frame_size);
-        if (ip_frame_size > 64) {
-          logf("  ...\n");
-        }
-      }
+    // Ignore packet, it too big
+    logf("eth packet truncated (too big, got %lu of %lu bytes)\n",
+         (unsigned long)(sizeof packet_addr), (unsigned long)recv_size);
+  } else if (!validate_eth_ip_frame(eth_frame, (size_t)recv_size)) {
+    // Ignore packet, not valid IP
+    logf("eth packet not valid ip (%lu bytes):\n", (unsigned long)recv_size);
+    hex_dump(stdlog, eth_frame, recv_size > 64 ? 64 : (size_t)recv_size);
+    if (recv_size > 64) {
+      logf("  ...\n");
     }
+  } else {
+    // A complete packet!
+    eth_process_frame(eth_frame);
+    free_packet_buf(eth_frame);
   }
 }
 
-bool eth_process_dhcp_response(void *eth_frame) {
+void eth_process_frame(struct eth_packet *eth_frame) {
+  ser_send(&eth_frame->ip);
+}
+
+bool eth_process_dhcp_response(struct eth_packet *eth_frame) {
   // TODO implement
   // first, check if a ser frame is available for the response
 }
 
-bool eth_process_arp_request(void *eth_frame) {
+bool eth_process_arp_request(struct eth_packet *eth_frame) {
   // TODO implement
 #if 0
   struct icmpechopkt ping_pkt;
@@ -551,6 +620,10 @@ bool eth_process_arp_request(void *eth_frame) {
 #endif
 }
 
+void eth_send(struct ip_packet *ip_frame) {
+  // TODO implement
+}
+
 int eth_get_ifindex(int eth_socket, char const *dev_name) {
   struct ifreq if_ioreq;
 
@@ -576,8 +649,9 @@ void eth_get_hwaddr(int eth_socket, char const *dev_name,
   memcpy(hwaddr, if_ioreq.ifr_hwaddr.sa_data, ETH_ALEN);
 }
 
-uint16_t ip_header_checksum(void const *frame, size_t header_size) {
-  uint8_t const *const buf = (uint8_t const *)frame;
+uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
+                            size_t header_size) {
+  uint8_t const *const buf = (uint8_t const *)ip_frame;
   uint32_t checksum = 0;
 
   for (size_t i = 0; i < header_size / 2; ++i) {
@@ -589,84 +663,104 @@ uint16_t ip_header_checksum(void const *frame, size_t header_size) {
   return ~checksum & 0xFFFF;
 }
 
-bool validate_ip_frame(void const *eth_frame, size_t eth_size) {
-  uint8_t const *buf = (uint8_t const *)eth_frame;
-  struct ethhdr const *eth_header = (struct ethhdr const *)eth_frame;
-
-  logf("dest: ");
-  for (size_t i = 0; i < ETH_ALEN; ++i) {
-    if (i > 0) logf(":");
-    logf("%02X", (int)eth_header->h_dest[i]);
-  }
-
-  logf(", src: ");
-  for (size_t i = 0; i < ETH_ALEN; ++i) {
-    if (i > 0) logf(":");
-    logf("%02X", (int)eth_header->h_source[i]);
-  }
-
-  uint16_t proto = ntohs(eth_header->h_proto);
-  size_t size = 0;
-  logf(", proto: 0x%X, eth_size:%lu\n", (unsigned)proto,
-       (unsigned long)eth_size);
+bool validate_eth_ip_frame(struct eth_packet const *eth_frame,
+                           size_t eth_size) {
+  uint16_t proto = ntohs(eth_frame->hdr.h_proto);
 
   if (proto < ETH_P_802_3_MIN) {
-    size = 0;
-    proto = ETH_P_802_3;
-  } else if ((proto == ETH_P_IP) &&
-             (eth_size >= sizeof(struct ethhdr) + sizeof(struct iphdr))) {
-    // The order of these tests is important -- some of them depend on prior
-    // tests passing to be safe, e.g. checking the header checksum after
-    // verifying that the received packet isn't truncated
-    struct iphdr const *header =
-        (struct iphdr const *)(buf + sizeof(struct ethhdr));
-    if (header->version != 4) {
-      logf("  bad version\n");
-      return false;
-    }
-    size_t header_size = header->ihl * 4;
-    if (header_size < sizeof(struct iphdr)) {
-      logf("  bad header size\n");
-      return false;
-    }
-    if (eth_size < sizeof(struct ethhdr) + header_size) {
-      logf("  truncated header\n");
-      return false;
-    }
-    uint16_t checksum = ip_header_checksum(header, header_size);
-    if (checksum != 0) {
-      logf("  bad header checksum\n");
-      return false;
-    }
-    size = ntohs(header->tot_len);
-    if (eth_size < sizeof(struct ethhdr) + size) {
-      logf("  truncated packet\n");
-      return false;
-    }
-    logf("  ip_size: %lu\n", (unsigned long)size);
+    // size = proto;
+    // proto = ETH_P_802_3;
+    return false;
+  }
+  if (proto != ETH_P_IP) {
+    return false;
+  }
+  return validate_ip_frame(&eth_frame->ip, eth_size - sizeof(struct ethhdr));
+}
+
+bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {
+  if (size < sizeof(struct iphdr)) {
+    logf("invalid IP packet: truncated header\n");
+    return false;
+  }
+  // The order of these tests is important -- some of them depend on prior
+  // tests passing to be safe, e.g. checking the header checksum after
+  // verifying that the received packet isn't truncated
+  if (ip_frame->hdr.version != 4) {
+    logf("invalid IP packet: bad version (%d)\n", (int)ip_frame->hdr.version);
+    return false;
+  }
+  size_t header_size = ip_frame->hdr.ihl * 4;
+  if (header_size < sizeof(struct iphdr)) {
+    logf("invalid IP packet: bad header size (%d)\n", (int)header_size);
+    return false;
+  }
+  uint16_t checksum = ip_header_checksum(ip_frame, header_size);
+  if (checksum != 0) {
+    logf("invalid IP packet: bad header checksum\n");
+    return false;
+  }
+  if (size < ntohs(ip_frame->hdr.tot_len)) {
+    logf("invalid IP packet: truncated packet (%d of %d)\n", (int)size,
+         (int)ntohs(ip_frame->hdr.tot_len));
+    return false;
+  }
+
+  return true;
+}
+
+struct eth_packet *alloc_packet_buf(void) {
+  if (packet_pool_unallocated_count > 0) {
+    --packet_pool_unallocated_count;
+    struct eth_packet *result =
+        packet_pool_unallocated[packet_pool_unallocated_count];
+    assert(result != NULL);
+    packet_pool_unallocated[packet_pool_unallocated_count] = NULL;
+    return result;
   } else {
-    // nothing
+    return NULL;
   }
-
-  return size > 0;
 }
 
-void *get_ip_frame(void *eth_frame) {
-  uint8_t *buf = (uint8_t *)eth_frame;
-  return buf + sizeof(struct ethhdr);
+void free_packet_buf(struct eth_packet *packet) {
+  assert(packet != NULL);
+  assert(packet_pool_unallocated_count < PACKET_POOL_SIZE);
+  packet_pool_unallocated[packet_pool_unallocated_count] = packet;
+  ++packet_pool_unallocated_count;
 }
 
-size_t get_ip_frame_size(void *frame) {
-  uint8_t *buf = (uint8_t *)frame;
-  struct iphdr const *header = (struct iphdr const *)buf;
-  return ntohs(header->tot_len);
-}
-
-uint8_t *get_ip_payload(void *eth_frame, size_t *out_payload_size) {
-  struct iphdr *header = (struct iphdr *)get_ip_frame(eth_frame);
-  size_t header_size = header->ihl * 4;
-  if (out_payload_size != NULL) {
-    *out_payload_size = ntohs(header->tot_len) - header_size;
+void hex_dump(FILE *f, void const *buf, size_t size) {
+  static char const hex_chars[] = "0123456789ABCDEF";
+  char line[128];
+  size_t k;
+  for (size_t i = 0; i < size; i += 16) {
+    k = 0;
+    line[k++] = hex_chars[(i >> 12) & 0xF];
+    line[k++] = hex_chars[(i >> 8) & 0xF];
+    line[k++] = hex_chars[(i >> 4) & 0xF];
+    line[k++] = hex_chars[(i >> 0) & 0xF];
+    line[k++] = ':';
+    line[k++] = ' ';
+    size_t n = (size - i) < 16 ? (size - i) : 16;
+    for (size_t j = 0; j < n; ++j) {
+      line[k++] = ' ';
+      uint8_t v = ((uint8_t const *)buf)[i + j];
+      line[k++] = hex_chars[(v >> 4) & 0xF];
+      line[k++] = hex_chars[(v >> 0) & 0xF];
+    }
+    memset(line + k, ' ', (16 - n) * 3);
+    k += (16 - n) * 3;
+    line[k++] = ' ';
+    line[k++] = '|';
+    for (size_t j = 0; j < n; ++j) {
+      uint8_t v = ((uint8_t const *)buf)[i + j];
+      line[k++] = ((v >= 32) && (v < 127)) ? v : '.';
+    }
+    memset(line + k, '-', 16 - n);
+    k += 16 - n;
+    line[k++] = '|';
+    line[k++] = '\n';
+    line[k++] = '\0';
+    fputs(line, f);
   }
-  return (uint8_t *)header + header_size;
 }

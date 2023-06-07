@@ -60,7 +60,7 @@ void hex_dump(void const *buf, size_t size) {
   }
 }
 
-#define MAX_PACKET_BUF 8192
+#define MAX_PACKET_SIZE 8192
 #define BUF_POOL_SIZE 6
 #define SLIP_SEND_QUEUE_SIZE 2
 #define ETH_SEND_QUEUE_SIZE 2
@@ -69,8 +69,8 @@ void hex_dump(void const *buf, size_t size) {
 #define ETH_IDX 0
 #define FDS_SIZE 1
 
-uint8_t ser_send_queue[SLIP_SEND_QUEUE_SIZE][MAX_PACKET_BUF];
-uint8_t eth_send_queue[ETH_SEND_QUEUE_SIZE][MAX_PACKET_BUF];
+uint8_t ser_send_queue[SLIP_SEND_QUEUE_SIZE][MAX_PACKET_SIZE];
+uint8_t eth_send_queue[ETH_SEND_QUEUE_SIZE][MAX_PACKET_SIZE];
 size_t ser_send_head = 0;
 size_t ser_send_tail = 0;
 size_t eth_send_head = 0;
@@ -196,7 +196,7 @@ void read_eth(void) {
   socklen_t packet_addr_len = sizeof packet_addr;
   ssize_t recv_size;
 
-  recv_size = recvfrom(eth_rx_socket, packet_buf, MAX_PACKET_BUF, MSG_DONTWAIT,
+  recv_size = recvfrom(eth_rx_socket, packet_buf, MAX_PACKET_SIZE, MSG_DONTWAIT,
                        (struct sockaddr *)&packet_addr, &packet_addr_len);
   if (recv_size < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
@@ -210,7 +210,7 @@ void read_eth(void) {
              (memcmp(((struct ethhdr const *)packet_buf)->h_dest, &dest_mac,
                      ETH_ALEN) != 0)) {
     // Ignore, wrong dest
-  } else if ((recv_size > MAX_PACKET_BUF) ||
+  } else if ((recv_size > MAX_PACKET_SIZE) ||
              (packet_addr_len > sizeof packet_addr)) {
     // Ignore packet,it too big
     printf("packet too big: %lu/%lu\n", (unsigned long)recv_size,

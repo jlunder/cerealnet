@@ -95,6 +95,9 @@ struct eth_packet {
   };
 } __attribute__((packed));
 
+bool verbose_log = false;
+bool very_verbose_log = false;
+
 // Round up to align to 16 bytes
 #define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
 #define SER_BUF_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
@@ -189,7 +192,7 @@ void parse_args(int argc, char *argv[]) {
 
   int opt;
   int res;
-  while ((opt = getopt(argc, argv, "s:e:m:MhT")) != -1) {
+  while ((opt = getopt(argc, argv, "s:e:m:Mvh")) != -1) {
     switch (opt) {
       case 'm': {
         force_eth_mac = true;
@@ -204,6 +207,7 @@ void parse_args(int argc, char *argv[]) {
       case 'e': {
         snprintf(eth_dev_name, IFNAMSIZ, "%s", optarg);
       } break;
+#if 0
       case 'T': {
         struct ip_packet pkt;
         pkt.hdr.version = 4;
@@ -222,6 +226,14 @@ void parse_args(int argc, char *argv[]) {
         pkt.hdr.check = ip_header_checksum(&pkt, pkt.hdr.ihl * 4);
         ser_send(&pkt);
         exit(0);
+      } break;
+#endif
+      case 'v': {
+        if (verbose_log) {
+          very_verbose_log = true;
+        } else {
+          verbose_log = true;
+        }
       } break;
       case 'h': {
         print_usage_and_exit(argv[0], NULL, 0);
@@ -310,19 +322,19 @@ void poll_loop(void) {
     }
 #endif
 
-    if (keepalive) {
+    if (keepalive && verbose_log) {
       logf("%lu: alive (%d)\n",
            cur_time.tv_sec * 1000LU + cur_time.tv_nsec / 1000000LU, poll_res);
     }
     if (poll_res > 0) {
       // Data available somewhere!
-      // if ((poll_fds[SER_IDX].revents & ~POLLIN) != 0) {
-      //   int re = poll_fds[SER_IDX].revents;
-      //   logf("While polling ethernet interface: %d ( %s%s%s)", re,
-      //        (re & POLLERR) != 0 ? "ERR " : "",
-      //        (re & POLLHUP) != 0 ? "HUP " : "",
-      //        (re & POLLNVAL) != 0 ? "INVAL " : "");
-      // }
+      if ((poll_fds[SER_IDX].revents & ~POLLIN) != 0) {
+        int re = poll_fds[SER_IDX].revents;
+        logf("While polling ethernet interface: %d ( %s%s%s)", re,
+             (re & POLLERR) != 0 ? "ERR " : "",
+             (re & POLLHUP) != 0 ? "HUP " : "",
+             (re & POLLNVAL) != 0 ? "INVAL " : "");
+      }
 
       if ((poll_fds[ETH_IDX].revents & ~POLLIN) != 0) {
         int re = poll_fds[ETH_IDX].revents;
@@ -332,9 +344,9 @@ void poll_loop(void) {
              (re & POLLNVAL) != 0 ? "INVAL " : "");
       }
 
-      // if ((poll_fds[SER_IDX].revents & POLLIN) != 0) {
-      //   ser_read_available();
-      // }
+      if ((poll_fds[SER_IDX].revents & POLLIN) != 0) {
+        ser_read_available();
+      }
       if ((poll_fds[ETH_IDX].revents & POLLIN) != 0) {
         eth_read_available();
       }
@@ -409,17 +421,30 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
         if (used == 0) {
           // Ignore silently, probably just a spacer put in by the client to
           // increase noise resistance
+          if (very_verbose_log) {
+            logf("ser packet received, zero-length\n");
+          }
         } else if (!validate_ip_frame(&ser_read_accum.ip, used)) {
           // Ignore packet, not valid IP
-          logf("ser packet not valid ip (%lu bytes):\n", (unsigned long)used);
-          hex_dump(stdlog, ser_read_accum.ip.ip_raw, used);
-          // size_t ext_size = sizeof(struct ethhdr) + used;
-          // hex_dump(stdlog, ser_read_accum.eth_raw,
-          //          ext_size > 64 ? 64 : ext_size);
-          // if (ext_size > 64) {
-          //   logf("  ...\n");
-          // }
+          if (verbose_log) {
+            logf("ser packet received, not valid ip (%lu bytes):\n",
+                 (unsigned long)used);
+            hex_dump(stdlog, ser_read_accum.ip.ip_raw, used);
+          }
         } else {
+          if (very_verbose_log) {
+            char srcaddr[20], destaddr[20];
+            inet_ntop(AF_INET, &ser_read_accum.ip.hdr.saddr, srcaddr,
+                      sizeof srcaddr);
+            inet_ntop(AF_INET, &ser_read_accum.ip.hdr.daddr, destaddr,
+                      sizeof destaddr);
+            logf(
+                "ser packet received, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+                "sa=%s, da=%s\n",
+                (unsigned long)used,
+                (unsigned long)ntohs(ser_read_accum.ip.hdr.tot_len),
+                (int)ser_read_accum.ip.hdr.protocol, srcaddr, destaddr);
+          }
           ser_process(&ser_read_accum.ip);
         }
         // Packet has either been discarded or processed, start a new one
@@ -445,29 +470,21 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
 
 void ser_process(struct ip_packet *ip_frame) {
   // TODO implement
-  logf("received SLIP packet:\n");
-  hex_dump(stdlog, ip_frame->ip_raw, ntohs(ip_frame->hdr.tot_len));
 }
 
 bool ser_process_dhcp_request(struct ip_packet *ip_frame) {
   // TODO implement
 }
 
-bool ser_process_arp_request(struct ip_packet *ip_frame) {
-  // TODO implement
-}
-
-bool ser_process_arp_response(struct ip_packet *ip_frame) {
-  // TODO implement
-}
-
 void ser_send(struct ip_packet const *ip_frame) {
   assert(ser_write_buf_head == 0);
-
-  logf("ser_send packet:\n");
-  hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
-
   assert(validate_ip_frame(ip_frame, sizeof *ip_frame));
+
+  if (very_verbose_log) {
+    logf("ser_send packet:\n");
+    hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
+  }
+
   size_t size = ntohs(ip_frame->hdr.tot_len);
   // For each byte in the packet, send the appropriate character sequence
   size_t i = 0;
@@ -520,8 +537,8 @@ void ser_send(struct ip_packet const *ip_frame) {
   ser_write_buf_tail = 0;
   ser_write_buf_head = j;
 
-  logf("SLIP encoded:\n");
-  hex_dump(stdlog, ser_write_buf, j);
+  // logf("SLIP encoded:\n");
+  // hex_dump(stdlog, ser_write_buf, j);
   ser_try_write_pending();
 }
 
@@ -532,9 +549,9 @@ bool ser_try_write_pending(void) {
 
   // Write the buffer to the serial port
   ssize_t amount = ser_write_buf_head - ser_write_buf_tail;
-  ssize_t result = amount;  // write(ser_fd, ser_write_buf + ser_write_buf_tail,
-                            // (size_t)amount);
-  ser_accumulate_bytes(ser_write_buf + ser_write_buf_tail, amount);
+  ssize_t result =
+      write(ser_fd, ser_write_buf + ser_write_buf_tail, (size_t)amount);
+
   if (result < 0) {
     perror("write to ser failed");
     ser_write_buf_head = 0;
@@ -575,26 +592,43 @@ void eth_read_available(void) {
     }
   } else if (recv_size < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
-    logf("eth packet runt frame (%lu bytes)\n", (unsigned long)recv_size);
-  } else if ((memcmp(((struct ethhdr const *)eth_frame)->h_dest, &eth_mac,
-                     ETH_ALEN) != 0) &&
-             (memcmp(((struct ethhdr const *)eth_frame)->h_dest, &broadcast_mac,
-                     ETH_ALEN) != 0)) {
-    // Ignore packet, wrong dest
+    if (verbose_log) {
+      logf("eth packet received, runt frame (%lu bytes)\n",
+           (unsigned long)recv_size);
+    }
+  } else if ((memcmp(&eth_frame->hdr.h_dest, &eth_mac, ETH_ALEN) != 0) &&
+             (memcmp(&eth_frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
+    // Ignore packet, not for us
+    // TODO multicast support? Not sure how this works
+    if (very_verbose_log) {
+      logf("eth packet received, for another host (%s)\n",
+           ether_ntoa((struct ether_addr const *)&eth_frame->hdr.h_dest));
+    }
   } else if ((recv_size > MAX_PACKET_SIZE) ||
              (packet_addr_len > sizeof packet_addr)) {
-    // Ignore packet, it too big
-    logf("eth packet truncated (too big, got %lu of %lu bytes)\n",
+    // Ignore packet, too big (extra jumbo frame? We can't handle it)
+    logf("eth packet received, too big (trucated to %lu of %lu bytes)\n",
          (unsigned long)(sizeof packet_addr), (unsigned long)recv_size);
   } else if (!validate_eth_ip_frame(eth_frame, (size_t)recv_size)) {
     // Ignore packet, not valid IP
-    // logf("eth packet not valid ip (%lu bytes):\n", (unsigned long)recv_size);
-    // hex_dump(stdlog, eth_frame, recv_size > 64 ? 64 : (size_t)recv_size);
-    // if (recv_size > 64) {
-    //   logf("  ...\n");
-    // }
+    if (verbose_log) {
+      logf("eth packet received, not valid ip (%lu bytes):\n",
+           (unsigned long)recv_size);
+      hex_dump(stdlog, &eth_frame->eth_raw, recv_size);
+    }
   } else {
     // A complete packet!
+    if (very_verbose_log) {
+      char srcaddr[20], destaddr[20];
+      inet_ntop(AF_INET, &eth_frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
+      inet_ntop(AF_INET, &eth_frame->ip.hdr.daddr, destaddr, sizeof destaddr);
+      logf(
+          "eth packet received, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+          "sa=%s, da=%s\n",
+          (unsigned long)recv_size,
+          (unsigned long)ntohs(eth_frame->ip.hdr.tot_len),
+          (int)eth_frame->ip.hdr.protocol, srcaddr, destaddr);
+    }
     eth_process_frame(eth_frame);
   }
   free_packet_buf(eth_frame);
@@ -606,52 +640,16 @@ void eth_process_frame(struct eth_packet *eth_frame) {
 
 bool eth_process_dhcp_response(struct eth_packet *eth_frame) {
   // TODO implement
-  // first, check if a ser frame is available for the response
-}
-
-bool eth_process_arp_request(struct eth_packet *eth_frame) {
-  // TODO implement
-#if 0
-  struct icmpechopkt ping_pkt;
-
-  memset(&ping_pkt, 0, sizeof ping_pkt);
-
-  memcpy(&ping_pkt.eth.h_source, &source_mac.ether_addr_octet, ETH_ALEN);
-  memcpy(&ping_pkt.eth.h_dest, &dest_mac.ether_addr_octet, ETH_ALEN);
-  ping_pkt.eth.h_proto = htons(ETH_P_IP);
-
-  ping_pkt.ip.version = 4;
-  ping_pkt.ip.ihl = 5;
-  ping_pkt.ip.tos = 0;
-  ping_pkt.ip.tot_len = htons(offsetof(struct ping_pkt_struct, payload[32]) -
-                              offsetof(struct ping_pkt_struct, ip));
-  ping_pkt.ip.id = htons(0x3103);
-  ping_pkt.ip.frag_off = htons(0);
-  ping_pkt.ip.ttl = 0x80;
-  ping_pkt.ip.protocol = 0x01;
-  // ping_pkt.ip.check
-  // ping_pkt.ip.saddr = htonl(0xC0A80078);
-  // ping_pkt.ip.daddr = htonl(0xC0A800DC);
-  ping_pkt.ip.saddr = source_ip.s_addr;
-  ping_pkt.ip.daddr = dest_ip.s_addr;
-  ping_pkt.ip.check = ip_header_checksum(&ping_pkt.ip, sizeof(struct iphdr));
-
-  ping_pkt.icmp.type = 0x08;
-  ping_pkt.icmp.code = 0x00;
-  // ping_pkt.ping.checksum
-  struct timespec cur_time;
-  clock_gettime(CLOCK_MONOTONIC, &cur_time);
-  ping_pkt.icmp.un.echo.id =
-      htons(((cur_time.tv_nsec / 1000) ^ cur_time.tv_sec) & 0xFFFF);
-  ping_pkt.icmp.un.echo.sequence = htons(1);
-  strncpy(ping_pkt.payload, "abcdefghijklmnopqrstuvwabcdefghi", 32);
-  ping_pkt.icmp.checksum = ip_header_checksum(
-      &ping_pkt.icmp, offsetof(struct ping_pkt_struct, payload[32]) -
-                          offsetof(struct ping_pkt_struct, icmp));
-#endif
 }
 
 void eth_send(struct ip_packet *ip_frame) {
+  assert(validate_ip_frame(ip_frame, sizeof *ip_frame));
+
+  if (very_verbose_log) {
+    logf("ser_send packet:\n");
+    hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
+  }
+
   // TODO implement
 }
 

@@ -22,15 +22,21 @@ size_t ser_write_buf_tail = 0;
 size_t ser_send_head = 0;
 size_t ser_send_tail = 0;
 
+int ser_fd;
+
+#ifdef USE_IF_ETH
 size_t eth_send_head = 0;
 size_t eth_send_tail = 0;
-
-int ser_fd;
 int eth_socket;
+#endif
+
+#ifdef USE_IF_PKT
+int pkt_socket;
+#endif
 
 // the MAC address we're applying to packets bridged from the SLIP interface
 struct ether_addr eth_mac;
-struct ether_addr broadcast_mac = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+struct ether_addr broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
@@ -54,9 +60,20 @@ void parse_args(int argc, char *argv[]) {
   bool force_eth_mac = false;
 
   int opt;
-  int res;
-  while ((opt = getopt(argc, argv, "s:e:m:Mvh")) != -1) {
+  while ((opt = getopt(argc, argv,
+                       "s:"
+#ifdef USE_IF_ETH
+                       "e:m:"
+#endif
+#ifdef USE_IF_PKT
+#endif
+                       "vh")) != -1) {
     switch (opt) {
+      case 's': {
+        snprintf(ser_dev_name, PATH_MAX, "%s", optarg);
+      } break;
+
+#ifdef USE_IF_ETH
       case 'm': {
         force_eth_mac = true;
         if ((tmp_mac = ether_aton(optarg)) == NULL) {
@@ -64,12 +81,14 @@ void parse_args(int argc, char *argv[]) {
         }
         memcpy(&eth_mac, tmp_mac, sizeof(struct ether_addr));
       } break;
-      case 's': {
-        snprintf(ser_dev_name, PATH_MAX, "%s", optarg);
-      } break;
       case 'e': {
         snprintf(eth_dev_name, IFNAMSIZ, "%s", optarg);
       } break;
+#endif
+
+#ifdef USE_IF_PKT
+#endif
+
 #if 0
       case 'T': {
         struct ip_packet pkt;
@@ -91,6 +110,7 @@ void parse_args(int argc, char *argv[]) {
         exit(0);
       } break;
 #endif
+
       case 'v': {
         if (verbose_log) {
           very_verbose_log = true;
@@ -107,36 +127,8 @@ void parse_args(int argc, char *argv[]) {
     }
   }
 
-  // TODO enumerate serial devices
-  // if (strlen(rx_dev_name) == 0) {
-  //   snprintf(rx_dev_name, sizeof rx_dev_name, "wlp3s0");
-  // }
-
-  // TODO enumerate ethernet devices
-  // if (strlen(tx_dev_name) == 0) {
-  //   snprintf(tx_dev_name, sizeof tx_dev_name, "enp0s25");
-  // }
-
-  if (strlen(ser_dev_name) > 0) {
-    ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY);
-    if (ser_fd < 0) {
-      perror("open() failed for serial socket");
-      exit(1);
-    }
-  } else {
-    ser_fd = -1;
-  }
-
-  // Create a raw socket
-  eth_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-  if (eth_socket < 0) {
-    perror("socket() failed for ethernet socket");
-    exit(1);
-  }
-
-  if (!force_eth_mac && strlen(eth_dev_name) > 0) {
-    eth_get_hwaddr(eth_socket, eth_dev_name, &eth_mac);
-  }
+  ser_init(ser_dev_name);
+  eth_init(eth_dev_name, force_eth_mac);
 }
 
 void print_usage_and_exit(char const *argv0, char const *extra_message,
@@ -144,7 +136,18 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
   if (extra_message != NULL) {
     logf("%s\n\n", extra_message);
   }
-  logf("Usage: %s [-s SERIALDEV] [-e ETHDEV] [-m MAC | -M]\n", argv0);
+  logf(
+      "Usage: %s [-s SERIALDEV]"
+
+#ifdef USE_IF_ETH
+      " [-e ETHDEV] [-m MAC ]"
+#endif
+
+#ifdef USE_IF_PKT
+#endif
+
+      "\n",
+      argv0);
   exit(result);
 }
 
@@ -159,9 +162,17 @@ void poll_loop(void) {
     poll_fds[SER_IDX].events = POLLIN;
     poll_fds[SER_IDX].revents = 0;
 
+#ifdef USE_IF_ETH
     poll_fds[ETH_IDX].fd = eth_socket;
     poll_fds[ETH_IDX].events = POLLIN;
     poll_fds[ETH_IDX].revents = 0;
+#endif
+
+#ifdef USE_IF_PKT
+    poll_fds[PKT_IDX].fd = pkt_socket;
+    poll_fds[PKT_IDX].events = POLLIN;
+    poll_fds[PKT_IDX].revents = 0;
+#endif
 
     int poll_res = poll(poll_fds, FDS_SIZE, 100);
 

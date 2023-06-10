@@ -1,5 +1,25 @@
 #include "etherslip.h"
 
+#ifdef USE_IF_ETH
+
+void eth_init(char const *eth_dev_name, bool force_eth_mac) {
+  // TODO enumerate ethernet devices
+  // if (strlen(tx_dev_name) == 0) {
+  //   snprintf(tx_dev_name, sizeof tx_dev_name, "enp0s25");
+  // }
+
+  // Create a raw socket
+  eth_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+  if (eth_socket < 0) {
+    perror("socket() failed for ethernet socket");
+    exit(1);
+  }
+
+  if (!force_eth_mac && strlen(eth_dev_name) > 0) {
+    eth_get_hwaddr(eth_socket, eth_dev_name, &eth_mac);
+  }
+}
+
 void eth_read_available(void) {
   // Try reading the ethernet interface -- despite the name it's okay to stop
   // at reading/processing a single packet
@@ -23,7 +43,7 @@ void eth_read_available(void) {
       perror("recvfrom failed");
       exit(1);
     }
-  } else if (recv_size < sizeof(struct ethhdr)) {
+  } else if ((size_t)recv_size < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
     if (verbose_log) {
       logf("eth packet received, runt frame (%lu bytes)\n",
@@ -73,6 +93,8 @@ void eth_process_frame(struct eth_packet *eth_frame) {
 
 bool eth_process_dhcp_response(struct eth_packet *eth_frame) {
   // TODO implement
+  (void)eth_frame;
+  return true;
 }
 
 void eth_send(struct ip_packet *ip_frame) {
@@ -110,3 +132,5 @@ void eth_get_hwaddr(int eth_socket, char const *dev_name,
   }
   memcpy(hwaddr, if_ioreq.ifr_hwaddr.sa_data, ETH_ALEN);
 }
+
+#endif

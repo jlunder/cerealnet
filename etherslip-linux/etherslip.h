@@ -27,6 +27,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if !defined(USE_IF_PKT) && !defined(USE_IF_ETH)
+#define USE_IF_ETH
+#endif
+
 #define stdlog stderr
 #define logf(...) fprintf(stdlog, __VA_ARGS__)
 
@@ -34,7 +38,12 @@
 #define PACKET_POOL_SIZE 6
 
 #define SER_IDX 0
+#ifdef USE_IF_PKT
+#define PKT_IDX 1
+#endif
+#ifdef USE_IF_ETH
 #define ETH_IDX 1
+#endif
 #define FDS_SIZE 2
 
 // SLIP implementation adapted from sample code in RFC 1055
@@ -140,27 +149,33 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
 
 void poll_loop(void);
 
+void ser_init(char const *ser_dev_name);
 void ser_read_available(void);
-
 void ser_accumulate_bytes(uint8_t *data, size_t size);
 void ser_process(struct ip_packet *ip_frame);
 bool ser_process_dhcp_request(struct ip_packet *ip_frame);
-
 void ser_send(struct ip_packet const *ip_frame);
-
 bool ser_try_write_pending(void);
 
-void eth_read_available(void);
+#ifdef USE_IF_PKT
+void pkt_init(void);
+void pkt_read_available(void);
+void pkt_process_frame(struct ip_packet *ip_frame);
+void pkt_send(struct ip_packet *ip_frame);
+#endif
 
+#ifdef USE_IF_ETH
+void eth_init(char const *eth_dev_name, bool force_eth_mac);
+void eth_read_available(void);
 void eth_process_frame(struct eth_packet *eth_frame);
 bool eth_process_dhcp_response(struct eth_packet *eth_frame);
 bool eth_process_arp_request(struct eth_packet *eth_frame);
-
 void eth_send(struct ip_packet *ip_frame);
 
 int eth_get_ifindex(int eth_socket, char const *dev_name);
 void eth_get_hwaddr(int eth_socket, char const *dev_name,
                     struct ether_addr *hwaddr);
+#endif
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size);

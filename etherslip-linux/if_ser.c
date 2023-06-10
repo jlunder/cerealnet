@@ -1,5 +1,22 @@
 #include "etherslip.h"
 
+void ser_init(char const *ser_dev_name) {
+  // TODO enumerate serial devices
+  // if (strlen(rx_dev_name) == 0) {
+  //   snprintf(rx_dev_name, sizeof rx_dev_name, "wlp3s0");
+  // }
+
+  if (strlen(ser_dev_name) > 0) {
+    ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY);
+    if (ser_fd < 0) {
+      perror("open() failed for serial socket");
+      exit(1);
+    }
+  } else {
+    ser_fd = -1;
+  }
+}
+
 void ser_read_available(void) {
   // TODO implement
 }
@@ -116,10 +133,13 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
 
 void ser_process(struct ip_packet *ip_frame) {
   // TODO implement
+  (void)ip_frame;
 }
 
 bool ser_process_dhcp_request(struct ip_packet *ip_frame) {
   // TODO implement
+  (void)ip_frame;
+  return false;
 }
 
 void ser_send(struct ip_packet const *ip_frame) {

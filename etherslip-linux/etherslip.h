@@ -28,7 +28,7 @@
 #include <unistd.h>
 
 #if !defined(USE_IF_PKT) && !defined(USE_IF_ETH)
-#define USE_IF_ETH
+#define USE_IF_PKT
 #endif
 
 #define stdlog stderr
@@ -38,11 +38,11 @@
 #define PACKET_POOL_SIZE 6
 
 #define SER_IDX 0
-#ifdef USE_IF_PKT
-#define PKT_IDX 1
-#endif
 #ifdef USE_IF_ETH
 #define ETH_IDX 1
+#endif
+#ifdef USE_IF_PKT
+#define PKT_IDX 1
 #endif
 #define FDS_SIZE 2
 
@@ -129,15 +129,20 @@ extern size_t ser_write_buf_tail;
 extern size_t ser_send_head;
 extern size_t ser_send_tail;
 
-extern size_t eth_send_head;
-extern size_t eth_send_tail;
-
 extern int ser_fd;
+
+#ifdef USE_IF_ETH
 extern int eth_socket;
 
 // the MAC address we're applying to packets bridged from the SLIP interface
 extern struct ether_addr eth_mac;
 extern struct ether_addr broadcast_mac;
+#endif
+
+#ifdef USE_IF_PKT
+extern int pkt_send_socket;
+extern int pkt_recv_socket;
+#endif
 
 // the MAC address the SLIP device uses for itself (only in DHCP packets)
 #define ser_dhcp_mac (ser_read_accum.eth.h_source)
@@ -157,13 +162,6 @@ bool ser_process_dhcp_request(struct ip_packet *ip_frame);
 void ser_send(struct ip_packet const *ip_frame);
 bool ser_try_write_pending(void);
 
-#ifdef USE_IF_PKT
-void pkt_init(void);
-void pkt_read_available(void);
-void pkt_process_frame(struct ip_packet *ip_frame);
-void pkt_send(struct ip_packet *ip_frame);
-#endif
-
 #ifdef USE_IF_ETH
 void eth_init(char const *eth_dev_name, bool force_eth_mac);
 void eth_read_available(void);
@@ -172,9 +170,15 @@ bool eth_process_dhcp_response(struct eth_packet *eth_frame);
 bool eth_process_arp_request(struct eth_packet *eth_frame);
 void eth_send(struct ip_packet *ip_frame);
 
-int eth_get_ifindex(int eth_socket, char const *dev_name);
 void eth_get_hwaddr(int eth_socket, char const *dev_name,
                     struct ether_addr *hwaddr);
+#endif
+
+#ifdef USE_IF_PKT
+void pkt_init(void);
+void pkt_read_available(void);
+void pkt_process_frame(struct ip_packet *ip_frame);
+void pkt_send(struct ip_packet *ip_frame);
 #endif
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
@@ -184,6 +188,8 @@ bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size);
 
 struct eth_packet *alloc_packet_buf(void);
 void free_packet_buf(struct eth_packet *packet);
+
+int sock_get_ifindex(int eth_socket, char const *dev_name);
 
 void hex_dump(FILE *f, void const *buf, size_t size);
 

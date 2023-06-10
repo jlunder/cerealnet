@@ -57,11 +57,10 @@ void eth_read_available(void) {
       logf("eth packet received, for another host (%s)\n",
            ether_ntoa((struct ether_addr const *)&eth_frame->hdr.h_dest));
     }
-  } else if ((recv_size > MAX_PACKET_SIZE) ||
-             (packet_addr_len > sizeof packet_addr)) {
+  } else if (recv_size > MAX_PACKET_SIZE) {
     // Ignore packet, too big (extra jumbo frame? We can't handle it)
     logf("eth packet received, too big (trucated to %lu of %lu bytes)\n",
-         (unsigned long)(sizeof packet_addr), (unsigned long)recv_size);
+         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)recv_size);
   } else if (!validate_eth_ip_frame(eth_frame, (size_t)recv_size)) {
     // Ignore packet, not valid IP
     if (verbose_log) {
@@ -106,18 +105,6 @@ void eth_send(struct ip_packet *ip_frame) {
   }
 
   // TODO implement
-}
-
-int eth_get_ifindex(int eth_socket, char const *dev_name) {
-  struct ifreq if_ioreq;
-
-  memset(&if_ioreq, 0, sizeof if_ioreq);
-  snprintf(if_ioreq.ifr_name, IFNAMSIZ, "%s", dev_name);
-  if (ioctl(eth_socket, SIOCGIFINDEX, &if_ioreq) < 0) {
-    perror("get socket index failed");
-    exit(1);
-  }
-  return if_ioreq.ifr_ifindex;
 }
 
 void eth_get_hwaddr(int eth_socket, char const *dev_name,

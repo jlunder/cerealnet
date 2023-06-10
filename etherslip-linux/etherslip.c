@@ -31,12 +31,16 @@ int eth_socket;
 #endif
 
 #ifdef USE_IF_PKT
-int pkt_socket;
+int pkt_send_socket;
+int pkt_recv_socket;
 #endif
 
-// the MAC address we're applying to packets bridged from the SLIP interface
+#ifdef USE_IF_ETH
+int eth_socket;
+
 struct ether_addr eth_mac;
 struct ether_addr broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+#endif
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
@@ -54,10 +58,11 @@ int main(int argc, char *argv[]) {
 
 void parse_args(int argc, char *argv[]) {
   char ser_dev_name[PATH_MAX] = "";
+#ifdef USE_IF_ETH
   char eth_dev_name[IFNAMSIZ] = "";
   struct ether_addr const *tmp_mac;
-
   bool force_eth_mac = false;
+#endif
 
   int opt;
   while ((opt = getopt(argc, argv,
@@ -128,7 +133,13 @@ void parse_args(int argc, char *argv[]) {
   }
 
   ser_init(ser_dev_name);
+#ifdef USE_IF_ETH
   eth_init(eth_dev_name, force_eth_mac);
+#endif
+
+#ifdef USE_IF_PKT
+  pkt_init();
+#endif
 }
 
 void print_usage_and_exit(char const *argv0, char const *extra_message,
@@ -169,7 +180,7 @@ void poll_loop(void) {
 #endif
 
 #ifdef USE_IF_PKT
-    poll_fds[PKT_IDX].fd = pkt_socket;
+    poll_fds[PKT_IDX].fd = pkt_recv_socket;
     poll_fds[PKT_IDX].events = POLLIN;
     poll_fds[PKT_IDX].revents = 0;
 #endif
@@ -202,28 +213,49 @@ void poll_loop(void) {
     }
     if (poll_res > 0) {
       // Data available somewhere!
+
+      // Check for errors
       if ((poll_fds[SER_IDX].revents & ~POLLIN) != 0) {
         int re = poll_fds[SER_IDX].revents;
-        logf("While polling ethernet interface: %d ( %s%s%s)", re,
+        logf("While polling ser interface: %d ( %s%s%s)", re,
              (re & POLLERR) != 0 ? "ERR " : "",
              (re & POLLHUP) != 0 ? "HUP " : "",
              (re & POLLNVAL) != 0 ? "INVAL " : "");
       }
-
-      if ((poll_fds[ETH_IDX].revents & ~POLLIN) != 0) {
-        int re = poll_fds[ETH_IDX].revents;
-        logf("While polling serial interface: %d ( %s%s%s)", re,
-             (re & POLLERR) != 0 ? "ERR " : "",
-             (re & POLLHUP) != 0 ? "HUP " : "",
-             (re & POLLNVAL) != 0 ? "INVAL " : "");
-      }
-
+      // Check for data
       if ((poll_fds[SER_IDX].revents & POLLIN) != 0) {
         ser_read_available();
       }
+
+#ifdef USE_IF_ETH
+      // Check for errors
+      if ((poll_fds[ETH_IDX].revents & ~POLLIN) != 0) {
+        int re = poll_fds[ETH_IDX].revents;
+        logf("While polling eth interface: %d ( %s%s%s)", re,
+             (re & POLLERR) != 0 ? "ERR " : "",
+             (re & POLLHUP) != 0 ? "HUP " : "",
+             (re & POLLNVAL) != 0 ? "INVAL " : "");
+      }
+      // Check for data
       if ((poll_fds[ETH_IDX].revents & POLLIN) != 0) {
         eth_read_available();
       }
+#endif
+
+#ifdef USE_IF_PKT
+      // Check for errors
+      if ((poll_fds[PKT_IDX].revents & ~POLLIN) != 0) {
+        int re = poll_fds[PKT_IDX].revents;
+        logf("While polling pkt interface: %d ( %s%s%s)", re,
+             (re & POLLERR) != 0 ? "ERR " : "",
+             (re & POLLHUP) != 0 ? "HUP " : "",
+             (re & POLLNVAL) != 0 ? "INVAL " : "");
+      }
+      // Check for data
+      if ((poll_fds[PKT_IDX].revents & POLLIN) != 0) {
+        pkt_read_available();
+      }
+#endif
     }
   }
 }
@@ -259,7 +291,7 @@ bool validate_eth_ip_frame(struct eth_packet const *eth_frame,
 
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {
   if (size < sizeof(struct iphdr)) {
-    logf("invalid IP packet: truncated header\n");
+    logf("invalid IP packet: truncated header (runt)\n");
     return false;
   }
   // The order of these tests is important -- some of them depend on prior
@@ -272,6 +304,10 @@ bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {
   size_t header_size = ip_frame->hdr.ihl * 4;
   if (header_size < sizeof(struct iphdr)) {
     logf("invalid IP packet: bad header size (%d)\n", (int)header_size);
+    return false;
+  }
+  if (size < header_size) {
+    logf("invalid IP packet: truncated header\n");
     return false;
   }
   uint16_t checksum = ip_header_checksum(ip_frame, header_size);
@@ -306,6 +342,18 @@ void free_packet_buf(struct eth_packet *packet) {
   assert(packet_pool_unallocated_count < PACKET_POOL_SIZE);
   packet_pool_unallocated[packet_pool_unallocated_count] = packet;
   ++packet_pool_unallocated_count;
+}
+
+int sock_get_ifindex(int fd, char const *dev_name) {
+  struct ifreq if_ioreq;
+
+  memset(&if_ioreq, 0, sizeof if_ioreq);
+  snprintf(if_ioreq.ifr_name, IFNAMSIZ, "%s", dev_name);
+  if (ioctl(fd, SIOCGIFINDEX, &if_ioreq) < 0) {
+    perror("get socket index failed");
+    exit(1);
+  }
+  return if_ioreq.ifr_ifindex;
 }
 
 void hex_dump(FILE *f, void const *buf, size_t size) {

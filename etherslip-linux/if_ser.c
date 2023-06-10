@@ -213,6 +213,12 @@ bool ser_try_write_pending(void) {
     return true;
   }
 
+  if (ser_fd == -1) {
+    ser_write_buf_head = 0;
+    ser_write_buf_tail = 0;
+    return false;
+  }
+
   // Write the buffer to the serial port
   ssize_t amount = ser_write_buf_head - ser_write_buf_tail;
   ssize_t result =
@@ -222,13 +228,13 @@ bool ser_try_write_pending(void) {
     perror("write to ser failed");
     ser_write_buf_head = 0;
     ser_write_buf_tail = 0;
-    return true;
+    return false;
   } else if (result < amount) {
     ser_write_buf_tail += result;
-    return false;
+    return true;
   } else {
     ser_write_buf_head = 0;
     ser_write_buf_tail = 0;
-    return true;
+    return false;
   }
 }

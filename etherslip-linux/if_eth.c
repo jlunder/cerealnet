@@ -16,7 +16,7 @@ void eth_init(char const *eth_dev_name, bool force_eth_mac) {
   }
 
   if (!force_eth_mac && strlen(eth_dev_name) > 0) {
-    eth_get_hwaddr(eth_socket, eth_dev_name, &eth_mac);
+    eth_get_hwaddr(eth_socket, eth_dev_name, &client_mac);
   }
 }
 
@@ -43,61 +43,15 @@ void eth_read_available(void) {
       perror("recvfrom failed");
       exit(1);
     }
-  } else if ((size_t)recv_size < sizeof(struct ethhdr)) {
-    // Runt ethernet frame? Not long enough for MAC??
-    if (verbose_log) {
-      logf("eth packet received, runt frame (%lu bytes)\n",
-           (unsigned long)recv_size);
-    }
-  } else if ((memcmp(&eth_frame->hdr.h_dest, &eth_mac, ETH_ALEN) != 0) &&
-             (memcmp(&eth_frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
-    // Ignore packet, not for us
-    // TODO multicast support? Not sure how this works
-    if (very_verbose_log) {
-      logf("eth packet received, for another host (%s)\n",
-           ether_ntoa((struct ether_addr const *)&eth_frame->hdr.h_dest));
-    }
-  } else if (recv_size > MAX_PACKET_SIZE) {
-    // Ignore packet, too big (extra jumbo frame? We can't handle it)
-    logf("eth packet received, too big (trucated to %lu of %lu bytes)\n",
-         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)recv_size);
-  } else if (!validate_eth_ip_frame(eth_frame, (size_t)recv_size)) {
-    // Ignore packet, not valid IP
-    if (verbose_log) {
-      logf("eth packet received, not valid ip (%lu bytes):\n",
-           (unsigned long)recv_size);
-      hex_dump(stdlog, &eth_frame->eth_raw, recv_size);
-    }
+    free_packet_buf(eth_frame);
   } else {
-    // A complete packet!
-    if (very_verbose_log) {
-      char srcaddr[20], destaddr[20];
-      inet_ntop(AF_INET, &eth_frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-      inet_ntop(AF_INET, &eth_frame->ip.hdr.daddr, destaddr, sizeof destaddr);
-      logf(
-          "eth packet received, %lu bytes; hdr tot_len=%lu, proto=%02X, "
-          "sa=%s, da=%s\n",
-          (unsigned long)recv_size,
-          (unsigned long)ntohs(eth_frame->ip.hdr.tot_len),
-          (int)eth_frame->ip.hdr.protocol, srcaddr, destaddr);
-    }
-    eth_process_frame(eth_frame);
+    eth_frame->recv_size = (size_t)recv_size;
+    net_process_frame(eth_frame);
   }
-  free_packet_buf(eth_frame);
 }
 
-void eth_process_frame(struct eth_packet *eth_frame) {
-  ser_send(&eth_frame->ip);
-}
-
-bool eth_process_dhcp_response(struct eth_packet *eth_frame) {
-  // TODO implement
-  (void)eth_frame;
-  return true;
-}
-
-void eth_send(struct ip_packet *ip_frame) {
-  assert(validate_ip_frame(ip_frame, sizeof *ip_frame));
+void eth_send(struct eth_packet *eth_frame) {
+  assert(validate_eth_ip_frame(eth_frame));
 
   if (very_verbose_log) {
     logf("ser_send packet:\n");

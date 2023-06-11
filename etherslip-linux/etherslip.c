@@ -11,7 +11,7 @@ struct eth_packet packet_pool[PACKET_POOL_SIZE];
 struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 size_t packet_pool_unallocated_count = 0;
 
-struct eth_packet ser_read_accum;
+struct eth_packet *ser_read_accum = NULL;
 size_t ser_read_accum_used = 0;
 bool ser_read_accum_esc = false;
 
@@ -37,10 +37,10 @@ int pkt_recv_socket;
 
 #ifdef USE_IF_ETH
 int eth_socket;
-
-struct ether_addr eth_mac;
-struct ether_addr broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 #endif
+
+struct ether_addr client_mac;
+struct ether_addr broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
@@ -84,7 +84,7 @@ void parse_args(int argc, char *argv[]) {
         if ((tmp_mac = ether_aton(optarg)) == NULL) {
           print_usage_and_exit(argv[0], "Bad arg: expected MAC address", 1);
         }
-        memcpy(&eth_mac, tmp_mac, sizeof(struct ether_addr));
+        memcpy(&client_mac, tmp_mac, sizeof(struct ether_addr));
       } break;
       case 'e': {
         snprintf(eth_dev_name, IFNAMSIZ, "%s", optarg);
@@ -260,6 +260,111 @@ void poll_loop(void) {
   }
 }
 
+void client_process_frame(struct eth_packet *eth_frame) {
+  if (eth_frame->recv_size < sizeof(struct ethhdr)) {
+    // Runt ethernet frame? Not long enough for MAC??
+    if (verbose_log) {
+      logf("client packet runt frame (%lu bytes)\n",
+           (unsigned long)eth_frame->recv_size);
+    }
+  } else if (!validate_ip_frame(&eth_frame->ip, ETH_IP_SIZE(eth_frame))) {
+    // Ignore packet, not valid IP
+    if (verbose_log) {
+      logf("client packet not valid (%lu bytes):\n",
+           (unsigned long)ETH_IP_SIZE(eth_frame));
+      hex_dump(stdlog, ser_read_accum->ip.ip_raw, ETH_IP_SIZE(eth_frame));
+    }
+  } else {
+    if (very_verbose_log) {
+      char srcaddr[20], destaddr[20];
+      inet_ntop(AF_INET, &ser_read_accum->ip.hdr.saddr, srcaddr,
+                sizeof srcaddr);
+      inet_ntop(AF_INET, &ser_read_accum->ip.hdr.daddr, destaddr,
+                sizeof destaddr);
+      logf(
+          "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+          "sa=%s, da=%s\n",
+          (unsigned long)ETH_IP_SIZE(eth_frame),
+          (unsigned long)ntohs(ser_read_accum->ip.hdr.tot_len),
+          (int)ser_read_accum->ip.hdr.protocol, srcaddr, destaddr);
+    }
+    memcpy(&ser_read_accum->hdr.h_dest, &client_mac, sizeof(struct ether_addr));
+    memcpy(&ser_read_accum->hdr.h_source, &broadcast_mac,
+           sizeof(struct ether_addr));
+    ser_read_accum->hdr.h_proto = ETH_P_IP;
+    if (!client_process_dhcp_request(eth_frame)) {
+      pkt_send(eth_frame);
+    }
+  }
+}
+
+bool client_process_dhcp_request(struct eth_packet *eth_frame) {
+  (void)eth_frame;
+  return false;
+}
+
+void net_process_frame(struct eth_packet *eth_frame) {
+  if (eth_frame->recv_size < sizeof(struct ethhdr)) {
+    // Runt ethernet frame? Not long enough for MAC??
+    if (verbose_log) {
+      logf("net packet runt frame (%lu bytes)\n",
+           (unsigned long)eth_frame->recv_size);
+    }
+#ifdef IF_USE_ETH
+  } else if ((memcmp(&eth_frame->hdr.h_dest, &eth_mac, ETH_ALEN) != 0) &&
+             (memcmp(&eth_frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
+    // Ignore packet, not for us
+    // TODO multicast support? Not sure how this works
+    if (very_verbose_log) {
+      logf("net packet for another host (%s)\n",
+           ether_ntoa((struct ether_addr const *)&eth_frame->hdr.h_dest));
+    }
+#endif
+  } else if (eth_frame->recv_size > MAX_PACKET_SIZE) {
+    // Ignore packet, too big (extra jumbo frame? We can't handle it)
+    logf("net packet too big (trucated to %lu of %lu bytes)\n",
+         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)eth_frame->recv_size);
+  } else if (!validate_eth_ip_frame(eth_frame)) {
+    // Ignore packet, not valid IP
+    if (verbose_log) {
+      logf("net packet not valid (%lu bytes):\n",
+           (unsigned long)eth_frame->recv_size);
+      hex_dump(stdlog, &eth_frame->eth_raw, eth_frame->recv_size);
+    }
+  } else {
+    // A complete packet!
+    if (very_verbose_log) {
+      char srcaddr[20], destaddr[20];
+      inet_ntop(AF_INET, &eth_frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
+      inet_ntop(AF_INET, &eth_frame->ip.hdr.daddr, destaddr, sizeof destaddr);
+      logf(
+          "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+          "sa=%s, da=%s\n",
+          (unsigned long)eth_frame->recv_size,
+          (unsigned long)ntohs(eth_frame->ip.hdr.tot_len),
+          (int)eth_frame->ip.hdr.protocol, srcaddr, destaddr);
+    }
+    if (!net_process_dhcp_response(eth_frame) &&
+        !net_process_arp_request(eth_frame)) {
+      ser_send(eth_frame);
+    }
+    // Don't free eth_frame, it's handed off to the other processors
+    return;
+  }
+
+  free_packet_buf(eth_frame);
+}
+
+bool net_process_dhcp_response(struct eth_packet *eth_frame) {
+  (void)eth_frame;
+  return false;
+}
+
+bool net_process_arp_request(struct eth_packet *eth_frame) {
+  (void)eth_frame;
+  return false;
+}
+
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size) {
   uint8_t const *const buf = (uint8_t const *)ip_frame;
@@ -274,10 +379,12 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
   return ~checksum & 0xFFFF;
 }
 
-bool validate_eth_ip_frame(struct eth_packet const *eth_frame,
-                           size_t eth_size) {
+bool validate_eth_ip_frame(struct eth_packet const *eth_frame) {
   uint16_t proto = ntohs(eth_frame->hdr.h_proto);
 
+  if (eth_frame->recv_size < sizeof(struct ethhdr)) {
+    return false;
+  }
   if (proto < ETH_P_802_3_MIN) {
     // size = proto;
     // proto = ETH_P_802_3;
@@ -286,7 +393,7 @@ bool validate_eth_ip_frame(struct eth_packet const *eth_frame,
   if (proto != ETH_P_IP) {
     return false;
   }
-  return validate_ip_frame(&eth_frame->ip, eth_size - sizeof(struct ethhdr));
+  return validate_ip_frame(&eth_frame->ip, ETH_IP_SIZE(eth_frame));
 }
 
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {

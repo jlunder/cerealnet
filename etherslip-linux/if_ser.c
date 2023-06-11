@@ -7,7 +7,7 @@ void ser_init(char const *ser_dev_name) {
   // }
 
   if (strlen(ser_dev_name) > 0) {
-    ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY);
+    ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (ser_fd < 0) {
       perror("open() failed for serial socket");
       exit(1);
@@ -18,7 +18,32 @@ void ser_init(char const *ser_dev_name) {
 }
 
 void ser_read_available(void) {
-  // TODO implement
+  uint8_t read_buf[512];
+  ssize_t res;
+
+  if (ser_read_accum == NULL) {
+    ser_read_accum = alloc_packet_buf();
+    if (ser_read_accum == NULL) {
+      // too many outbound packets queued?
+      return;
+    }
+  }
+
+  do {
+    res = read(ser_fd, read_buf, sizeof read_buf);
+    if (res < 0) {
+      perror("read() failed for serial socket");
+      exit(1);
+    }
+
+    if ((size_t)res > sizeof read_buf) {
+      logf("read() returned bad size %lu > %lu", (unsigned long)res,
+           (unsigned long)sizeof read_buf);
+      exit(1);
+    }
+
+    ser_accumulate_bytes(read_buf, (size_t)res);
+  } while (res == sizeof read_buf);
 }
 
 void ser_accumulate_bytes(uint8_t *data, size_t size) {
@@ -33,19 +58,19 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
     // If the last character was ESC, apply special processing to this one
     if (esc) {
       uint8_t c = data[i++];
-      assert(used < sizeof ser_read_accum.ip.ip_raw);
+      assert(used < sizeof ser_read_accum->ip.ip_raw);
       switch (c) {
         case SLIP_ESC_END: {
-          ser_read_accum.ip.ip_raw[used++] = SLIP_END;
+          ser_read_accum->ip.ip_raw[used++] = SLIP_END;
         } break;
         case SLIP_ESC_ESC: {
-          ser_read_accum.ip.ip_raw[used++] = SLIP_ESC;
+          ser_read_accum->ip.ip_raw[used++] = SLIP_ESC;
         } break;
         // If "c" is not one of these two, then we have a protocol violation.
         // The best bet seems to be to leave the byte alone and just stuff it
         // into the packet.
         default: {
-          ser_read_accum.ip.ip_raw[used++] = c;
+          ser_read_accum->ip.ip_raw[used++] = c;
         } break;
       }
       esc = false;
@@ -63,9 +88,9 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
     // Any found?
     if (j > i) {
       size_t amount = j - i;
-      assert(used + amount <= sizeof ser_read_accum.ip.ip_raw);
+      assert(used + amount <= sizeof ser_read_accum->ip.ip_raw);
       // Copy the entire block of non-special bytes at once
-      memcpy(ser_read_accum.ip.ip_raw + used, data + i, amount);
+      memcpy(ser_read_accum->ip.ip_raw + used, data + i, amount);
       used += amount;
       i = j;
       // Stop if we've emptied the input buffer
@@ -85,30 +110,12 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
           // Ignore silently, probably just a spacer put in by the client to
           // increase noise resistance
           if (very_verbose_log) {
-            logf("ser packet received, zero-length\n");
-          }
-        } else if (!validate_ip_frame(&ser_read_accum.ip, used)) {
-          // Ignore packet, not valid IP
-          if (verbose_log) {
-            logf("ser packet received, not valid ip (%lu bytes):\n",
-                 (unsigned long)used);
-            hex_dump(stdlog, ser_read_accum.ip.ip_raw, used);
+            logf("ser ignoring zero-length\n");
           }
         } else {
-          if (very_verbose_log) {
-            char srcaddr[20], destaddr[20];
-            inet_ntop(AF_INET, &ser_read_accum.ip.hdr.saddr, srcaddr,
-                      sizeof srcaddr);
-            inet_ntop(AF_INET, &ser_read_accum.ip.hdr.daddr, destaddr,
-                      sizeof destaddr);
-            logf(
-                "ser packet received, %lu bytes; hdr tot_len=%lu, proto=%02X, "
-                "sa=%s, da=%s\n",
-                (unsigned long)used,
-                (unsigned long)ntohs(ser_read_accum.ip.hdr.tot_len),
-                (int)ser_read_accum.ip.hdr.protocol, srcaddr, destaddr);
-          }
-          ser_process(&ser_read_accum.ip);
+          ser_read_accum->recv_size = sizeof(struct ethhdr) + used;
+          client_process_frame(ser_read_accum);
+          ser_read_accum = NULL;
         }
         // Packet has either been discarded or processed, start a new one
         used = 0;
@@ -131,20 +138,11 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
   ser_read_accum_esc = esc;
 }
 
-void ser_process(struct ip_packet *ip_frame) {
-  // TODO implement
-  (void)ip_frame;
-}
-
-bool ser_process_dhcp_request(struct ip_packet *ip_frame) {
-  // TODO implement
-  (void)ip_frame;
-  return false;
-}
-
-void ser_send(struct ip_packet const *ip_frame) {
+void ser_send(struct eth_packet *eth_frame) {
   assert(ser_write_buf_head == 0);
-  assert(validate_ip_frame(ip_frame, sizeof *ip_frame));
+  assert(eth_frame != NULL);
+  struct ip_packet *ip_frame = &eth_frame->ip;
+  assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(eth_frame)));
 
   if (very_verbose_log) {
     logf("ser_send packet:\n");

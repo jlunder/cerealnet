@@ -32,8 +32,12 @@ void ser_read_available(void) {
   do {
     res = read(ser_fd, read_buf, sizeof read_buf);
     if (res < 0) {
-      perror("read() failed for serial socket");
-      exit(1);
+      if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+        res = 0;
+      } else {
+        perror("read() failed for serial socket");
+        exit(1);
+      }
     }
 
     if ((size_t)res > sizeof read_buf) {
@@ -139,7 +143,6 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
 }
 
 void ser_send(struct eth_packet *eth_frame) {
-  assert(ser_write_buf_head == 0);
   assert(eth_frame != NULL);
   struct ip_packet *ip_frame = &eth_frame->ip;
   assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(eth_frame)));
@@ -153,28 +156,28 @@ void ser_send(struct eth_packet *eth_frame) {
   // For each byte in the packet, send the appropriate character sequence
   size_t i = 0;
   size_t j = 0;
-  assert(j + 1 <= SER_BUF_SIZE);
+  assert(j + 1 <= SER_WRITE_QUEUE_SIZE);
   // Send an initial END character to flush out any data that may have
   // accumulated in the receiver due to line noise
-  ser_write_buf[j++] = SLIP_END;
+  ser_write_queue[j++] = SLIP_END;
   while (i < size) {
     uint8_t c = ip_frame->ip_raw[i];
     switch (c) {
       // If it's the same code as an END character, we send a special two
       // character code so as not to make the receiver think we sent an END
       case SLIP_END: {
-        assert(j + 2 <= SER_BUF_SIZE);
-        ser_write_buf[j++] = SLIP_ESC;
-        ser_write_buf[j++] = SLIP_ESC_END;
+        assert(j + 2 <= SER_WRITE_QUEUE_SIZE);
+        ser_write_queue[j++] = SLIP_ESC;
+        ser_write_queue[j++] = SLIP_ESC_END;
         ++i;
       } break;
 
       // If it's the same code as an ESC character, we send a special two
       // character code so as not to make the receiver think we sent an ESC
       case SLIP_ESC: {
-        assert(j + 2 <= SER_BUF_SIZE);
-        ser_write_buf[j++] = SLIP_ESC;
-        ser_write_buf[j++] = SLIP_ESC_ESC;
+        assert(j + 2 <= SER_WRITE_QUEUE_SIZE);
+        ser_write_queue[j++] = SLIP_ESC;
+        ser_write_queue[j++] = SLIP_ESC_ESC;
         ++i;
       } break;
 
@@ -188,51 +191,51 @@ void ser_send(struct eth_packet *eth_frame) {
           ++k;
         }
         size_t amount = k - i;
-        assert(j + amount <= SER_BUF_SIZE);
-        memcpy(ser_write_buf + j, ip_frame->ip_raw + i, amount);
+        assert(j + amount <= SER_WRITE_QUEUE_SIZE);
+        memcpy(ser_write_queue + j, ip_frame->ip_raw + i, amount);
         i = k;
         j += amount;
       } break;
     }
   }
-  assert(j + 1 <= SER_BUF_SIZE);
-  ser_write_buf[j++] = SLIP_END;
+  assert(j + 1 <= SER_WRITE_QUEUE_SIZE);
+  ser_write_queue[j++] = SLIP_END;
 
-  ser_write_buf_tail = 0;
-  ser_write_buf_head = j;
+  ser_write_queue_tail = 0;
+  ser_write_queue_head = j;
 
   // logf("SLIP encoded:\n");
-  // hex_dump(stdlog, ser_write_buf, j);
-  ser_try_write_pending();
+  // hex_dump(stdlog, ser_write_queue, j);
+  ser_try_write_all_queued();
 }
 
-bool ser_try_write_pending(void) {
-  if (ser_write_buf_tail == ser_write_buf_head) {
-    return true;
+void ser_try_write_all_queued(void) {
+  if (ser_write_queue_tail == ser_write_queue_head) {
+    return;
   }
 
   if (ser_fd == -1) {
-    ser_write_buf_head = 0;
-    ser_write_buf_tail = 0;
-    return false;
+    ser_write_queue_head = 0;
+    ser_write_queue_tail = 0;
+    return;
   }
 
   // Write the buffer to the serial port
-  ssize_t amount = ser_write_buf_head - ser_write_buf_tail;
+  ssize_t amount = ser_write_queue_head - ser_write_queue_tail;
   ssize_t result =
-      write(ser_fd, ser_write_buf + ser_write_buf_tail, (size_t)amount);
+      write(ser_fd, ser_write_queue + ser_write_queue_tail, (size_t)amount);
 
   if (result < 0) {
+    if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+      return;
+    }
     perror("write to ser failed");
-    ser_write_buf_head = 0;
-    ser_write_buf_tail = 0;
-    return false;
-  } else if (result < amount) {
-    ser_write_buf_tail += result;
-    return true;
+    ser_write_queue_head = 0;
+    ser_write_queue_tail = 0;
+  } else if (result == amount) {
+    ser_write_queue_head = 0;
+    ser_write_queue_tail = 0;
   } else {
-    ser_write_buf_head = 0;
-    ser_write_buf_tail = 0;
-    return false;
+    ser_write_queue_tail += result;
   }
 }

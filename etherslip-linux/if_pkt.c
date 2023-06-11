@@ -67,14 +67,46 @@ void pkt_read_available(void) {
 }
 
 void pkt_send(struct eth_packet *eth_frame) {
-  assert(validate_ip_frame(&eth_frame->ip, sizeof eth_frame->ip));
+  assert(eth_frame != NULL);
+  struct ip_packet *ip_frame = &eth_frame->ip;
+  assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(eth_frame)));
 
   if (very_verbose_log) {
     logf("pkt_send packet:\n");
     hex_dump(stdlog, &eth_frame->ip, ntohs(eth_frame->ip.hdr.tot_len));
   }
 
-  // TODO implement
+  if (pkt_write_queue != NULL) {
+    if (verbose_log) {
+      logf("pkt_send last queued packet dropped\n");
+    }
+    free_packet_buf(pkt_write_queue);
+  }
+  pkt_write_queue = eth_frame;
+  pkt_try_write_all_queued();
+}
+
+void pkt_try_write_all_queued(void) {
+  if (pkt_write_queue == NULL) {
+    return;
+  }
+
+  ssize_t res;
+  struct sockaddr_ll dest_sa;
+  memset(&dest_sa, 0, sizeof dest_sa);
+  dest_sa.sll_family = AF_PACKET;
+  dest_sa.sll_halen = ETH_ALEN;
+  memcpy(&dest_sa, pkt_write_queue->hdr.h_dest, ETH_ALEN);
+  res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->recv_size,
+               MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);
+  if (res < 0) {
+    if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+      return;
+    }
+    perror("pkt sendto() failed");
+  }
+  free_packet_buf(pkt_write_queue);
+  pkt_write_queue = NULL;
 }
 
 #endif

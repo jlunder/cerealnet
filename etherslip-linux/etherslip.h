@@ -116,7 +116,7 @@ extern bool very_verbose_log;
 
 // Round up to align to 16 bytes
 #define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
-#define SER_BUF_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
+#define SER_WRITE_QUEUE_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
 
 extern struct eth_packet packet_pool[PACKET_POOL_SIZE];
 extern struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
@@ -126,22 +126,21 @@ extern struct eth_packet *ser_read_accum;
 extern size_t ser_read_accum_used;
 extern bool ser_read_accum_esc;
 
-extern uint8_t ser_write_buf[SER_BUF_SIZE];
-extern size_t ser_write_buf_head;
-extern size_t ser_write_buf_tail;
-
-extern size_t ser_send_head;
-extern size_t ser_send_tail;
+extern uint8_t ser_write_queue[SER_WRITE_QUEUE_SIZE];
+extern size_t ser_write_queue_head;
+extern size_t ser_write_queue_tail;
 
 extern int ser_fd;
 
 #ifdef USE_IF_ETH
 extern int eth_socket;
+extern struct eth_packet *eth_write_queue;
 #endif
 
 #ifdef USE_IF_PKT
 extern int pkt_send_socket;
 extern int pkt_recv_socket;
+extern struct eth_packet *pkt_write_queue;
 #endif
 
 // the MAC address we're applying to packets bridged from the SLIP interface
@@ -165,12 +164,13 @@ void ser_init(char const *ser_dev_name);
 void ser_read_available(void);
 void ser_accumulate_bytes(uint8_t *data, size_t size);
 void ser_send(struct eth_packet *eth_frame);
-bool ser_try_write_pending(void);
+void ser_try_write_all_queued(void);
 
 #ifdef USE_IF_ETH
 void eth_init(char const *eth_dev_name, bool force_eth_mac);
 void eth_read_available(void);
 void eth_send(struct eth_packet *eth_frame);
+void eth_try_write_all_queued(void);
 
 void eth_get_hwaddr(int eth_socket, char const *dev_name,
                     struct ether_addr *hwaddr);
@@ -180,6 +180,7 @@ void eth_get_hwaddr(int eth_socket, char const *dev_name,
 void pkt_init(void);
 void pkt_read_available(void);
 void pkt_send(struct eth_packet *eth_frame);
+void pkt_try_write_all_queued(void);
 #endif
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,

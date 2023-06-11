@@ -3,10 +3,6 @@
 bool verbose_log = false;
 bool very_verbose_log = false;
 
-// Round up to align to 16 bytes
-#define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
-#define SER_BUF_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
-
 struct eth_packet packet_pool[PACKET_POOL_SIZE];
 struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 size_t packet_pool_unallocated_count = 0;
@@ -15,9 +11,9 @@ struct eth_packet *ser_read_accum = NULL;
 size_t ser_read_accum_used = 0;
 bool ser_read_accum_esc = false;
 
-uint8_t ser_write_buf[SER_BUF_SIZE];
-size_t ser_write_buf_head = 0;
-size_t ser_write_buf_tail = 0;
+uint8_t ser_write_queue[SER_WRITE_QUEUE_SIZE];
+size_t ser_write_queue_head = 0;
+size_t ser_write_queue_tail = 0;
 
 size_t ser_send_head = 0;
 size_t ser_send_tail = 0;
@@ -25,18 +21,14 @@ size_t ser_send_tail = 0;
 int ser_fd;
 
 #ifdef USE_IF_ETH
-size_t eth_send_head = 0;
-size_t eth_send_tail = 0;
-int eth_socket;
+int eth_socket = -1;
+struct eth_packet *eth_write_queue = NULL;
 #endif
 
 #ifdef USE_IF_PKT
-int pkt_send_socket;
-int pkt_recv_socket;
-#endif
-
-#ifdef USE_IF_ETH
-int eth_socket;
+int pkt_send_socket = -1;
+int pkt_recv_socket = -1;
+struct eth_packet *pkt_write_queue = NULL;
 #endif
 
 struct ether_addr client_mac;
@@ -171,17 +163,26 @@ void poll_loop(void) {
   for (;;) {
     poll_fds[SER_IDX].fd = ser_fd;
     poll_fds[SER_IDX].events = POLLIN;
+    if (ser_write_queue_head != ser_write_queue_tail) {
+      poll_fds[SER_IDX].events |= POLLOUT;
+    }
     poll_fds[SER_IDX].revents = 0;
 
 #ifdef USE_IF_ETH
     poll_fds[ETH_IDX].fd = eth_socket;
     poll_fds[ETH_IDX].events = POLLIN;
+    if (eth_write_queue != NULL) {
+      poll_fds[ETH_IDX].events |= POLLOUT;
+    }
     poll_fds[ETH_IDX].revents = 0;
 #endif
 
 #ifdef USE_IF_PKT
     poll_fds[PKT_IDX].fd = pkt_recv_socket;
     poll_fds[PKT_IDX].events = POLLIN;
+    if (pkt_write_queue != NULL) {
+      poll_fds[PKT_IDX].events |= POLLOUT;
+    }
     poll_fds[PKT_IDX].revents = 0;
 #endif
 
@@ -255,6 +256,16 @@ void poll_loop(void) {
       if ((poll_fds[PKT_IDX].revents & POLLIN) != 0) {
         pkt_read_available();
       }
+#endif
+
+      ser_try_write_all_queued();
+
+#ifdef USE_IF_ETH
+      eth_try_write_all_queued();
+#endif
+
+#ifdef USE_IF_PKT
+      pkt_try_write_all_queued();
 #endif
     }
   }

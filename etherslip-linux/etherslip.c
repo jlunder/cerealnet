@@ -5,35 +5,16 @@ bool send_log = false;
 bool verbose_log = false;
 bool very_verbose_log = false;
 
+bool client_ready = false;
+
+uint32_t ser_bps = 115200;
+
 struct eth_packet packet_pool[PACKET_POOL_SIZE];
 struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 size_t packet_pool_unallocated_count = 0;
 
-struct eth_packet *ser_read_accum = NULL;
-size_t ser_read_accum_used = 0;
-bool ser_read_accum_esc = false;
-
-uint8_t ser_write_queue[SER_WRITE_QUEUE_SIZE];
-size_t ser_write_queue_head = 0;
-size_t ser_write_queue_tail = 0;
-
-size_t ser_send_head = 0;
-size_t ser_send_tail = 0;
-
-int ser_fd;
-
-#if USE_IF_ETH
-int eth_socket = -1;
-struct eth_packet *eth_write_queue = NULL;
-#elif USE_IF_PKT
-int pkt_send_socket = -1;
-int pkt_recv_socket = -1;
-struct eth_packet *pkt_write_queue = NULL;
-#else
-#error "Must specify an interface type"
-#endif
-
-struct ether_addr client_mac;
+struct ether_addr client_mac = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
+struct ether_addr host_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 
 int main(int argc, char *argv[]) {
@@ -55,14 +36,13 @@ void parse_args(int argc, char *argv[]) {
 #if USE_IF_ETH
   char eth_dev_name[IFNAMSIZ] = "";
   struct ether_addr const *tmp_mac;
-  bool force_eth_mac = false;
 #endif
 
   int opt;
   while ((opt = getopt(argc, argv,
                        "s:"
 #if USE_IF_ETH
-                       "e:m:"
+                       "Dpe:m:"
 #elif USE_IF_PKT
 #else
 #error "Must specify an interface type"
@@ -74,12 +54,19 @@ void parse_args(int argc, char *argv[]) {
       } break;
 
 #if USE_IF_ETH
+      case 'D': {
+        break;
+      }
+      case 'p': {
+        break;
+      }
       case 'm': {
-        force_eth_mac = true;
         if ((tmp_mac = ether_aton(optarg)) == NULL) {
-          print_usage_and_exit(argv[0], "Bad arg: expected MAC address", 1);
+          print_usage_and_exit(argv[0],
+                               "Bad argument to -m: expected MAC address", 1);
         }
         memcpy(&client_mac, tmp_mac, sizeof(struct ether_addr));
+        client_ready = true;
       } break;
       case 'e': {
         snprintf(eth_dev_name, IFNAMSIZ, "%s", optarg);
@@ -135,7 +122,7 @@ void parse_args(int argc, char *argv[]) {
 
   ser_init(ser_dev_name);
 #if USE_IF_ETH
-  eth_init(eth_dev_name, force_eth_mac);
+  eth_init(eth_dev_name);
 #elif USE_IF_PKT
   pkt_init();
 #else
@@ -149,16 +136,27 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
     logf("%s\n\n", extra_message);
   }
   logf(
-      "Usage: %s [-s SERIALDEV]"
-
 #if USE_IF_ETH
-      " [-e ETHDEV] [-m MAC ]"
+      "Usage: %s [-bempsD...]"
+      "\n"
+      "    -p          Proxy mode: use the host machine's MAC address\n"
+      "    -s <DEV>    Offer SLIP bridge to a client on DEV\n"
+      "    -b <BPS>    Set serial port speed to BPS (default: 115200)"
+      "    -e <DEV>    Bridge ethernet device DEV\n"
+      "    -m <MAC>    Use MAC, instead of autodetecting/proxying\n"
+      //"    -a <IP>     Enable rudimentary masquerading (ARP and rewriting)\n"
+      "    -D          Disable snooping of DHCP\n"
+      "\n"
+      "Cerealnet etherslip is a SLIP-to-ethernet bridge that can send and\n"
+      "receive packets via a unique MAC address, as if the bridged device\n"
+      "was a separate adapter sharing media with the host machine, without\n"
+      "messing with firewall rules and routing tables.\n"
 #elif USE_IF_PKT
+      "Usage: %s [-s SERIALDEV]"
 #else
 #error "Must specify an interface type"
 #endif
-
-      "\n",
+      "",
       argv0);
   exit(result);
 }
@@ -170,27 +168,9 @@ void poll_loop(void) {
   clock_gettime(CLOCK_MONOTONIC, &last_keepalive_time);
 
   for (;;) {
-    poll_fds[SER_IDX].fd = ser_fd;
-    poll_fds[SER_IDX].events = POLLIN;
-    if (ser_write_queue_head != ser_write_queue_tail) {
-      poll_fds[SER_IDX].events |= POLLOUT;
-    }
-    poll_fds[SER_IDX].revents = 0;
-
 #if USE_IF_ETH
-    poll_fds[ETH_IDX].fd = eth_socket;
-    poll_fds[ETH_IDX].events = POLLIN;
-    if (eth_write_queue != NULL) {
-      poll_fds[ETH_IDX].events |= POLLOUT;
-    }
-    poll_fds[ETH_IDX].revents = 0;
+    eth_setup_pollfd(&poll_fds[ETH_IDX]);
 #elif USE_IF_PKT
-    poll_fds[PKT_IDX].fd = pkt_recv_socket;
-    poll_fds[PKT_IDX].events = POLLIN;
-    if (pkt_write_queue != NULL) {
-      poll_fds[PKT_IDX].events |= POLLOUT;
-    }
-    poll_fds[PKT_IDX].revents = 0;
 #else
 #error "Must specify an interface type"
 #endif
@@ -292,41 +272,40 @@ void client_process_frame(struct eth_packet *frame) {
     if (verbose_log && send_log) {
       logf("client packet not valid (%lu bytes):\n",
            (unsigned long)ETH_IP_SIZE(frame));
-      hex_dump(stdlog, ser_read_accum->ip.ip_raw, ETH_IP_SIZE(frame));
+      hex_dump(stdlog, frame->ip.ip_raw, ETH_IP_SIZE(frame));
     }
-  } else {
-    if (very_verbose_log && send_log) {
-      char srcaddr[20], destaddr[20];
-      inet_ntop(AF_INET, &ser_read_accum->ip.hdr.saddr, srcaddr,
-                sizeof srcaddr);
-      inet_ntop(AF_INET, &ser_read_accum->ip.hdr.daddr, destaddr,
-                sizeof destaddr);
-      logf(
-          "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
-          "sa=%s, da=%s\n",
-          (unsigned long)ETH_IP_SIZE(frame),
-          (unsigned long)ntohs(ser_read_accum->ip.hdr.tot_len),
-          (int)ser_read_accum->ip.hdr.protocol, srcaddr, destaddr);
-    }
-    memcpy(&ser_read_accum->hdr.h_dest, &client_mac, sizeof(struct ether_addr));
-    memcpy(&ser_read_accum->hdr.h_source, &broadcast_mac,
-           sizeof(struct ether_addr));
-    ser_read_accum->hdr.h_proto = ETH_P_IP;
-    if (!client_process_dhcp_request(frame)) {
-#if USE_IF_ETH
-      eth_send(frame);
-#elif USE_IF_PKT
-#else
-      pkt_send(frame);
-#error "Must specify an interface type"
-#endif
-    }
+  } else if (client_forward_frame(frame)) {
+    frame = NULL;
+  }
+
+  if (frame != NULL) {
+    free_packet_buf(frame);
   }
 }
 
-bool client_process_dhcp_request(struct eth_packet *frame) {
-  (void)frame;
-  return false;
+bool client_forward_frame(struct eth_packet *frame) {
+  if (very_verbose_log && send_log) {
+    char srcaddr[20], destaddr[20];
+    inet_ntop(AF_INET, &frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
+    inet_ntop(AF_INET, &frame->ip.hdr.daddr, destaddr, sizeof destaddr);
+    logf(
+        "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+        "sa=%s, da=%s\n",
+        (unsigned long)ETH_IP_SIZE(frame),
+        (unsigned long)ntohs(frame->ip.hdr.tot_len),
+        (int)frame->ip.hdr.protocol, srcaddr, destaddr);
+  }
+
+  frame->hdr.h_proto = ETH_P_IP;
+#if USE_IF_ETH
+  eth_send(frame);
+#elif USE_IF_PKT
+  pkt_send(frame);
+#else
+#error "Must specify an interface type"
+#endif
+
+  return true;
 }
 
 void net_process_frame(struct eth_packet *frame) {
@@ -336,58 +315,90 @@ void net_process_frame(struct eth_packet *frame) {
       logf("net packet runt frame (%lu bytes)\n",
            (unsigned long)frame->recv_size);
     }
+  } else if (frame->recv_size > MAX_PACKET_SIZE) {
+    // Ignore packet, too big (extra jumbo frame? We can't handle it)
+    logf("net packet too big (trucated to %lu of %lu bytes)\n",
+         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->recv_size);
+  }
 #if USE_IF_ETH
-  } else if ((memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
-             (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
-    // Ignore packet, not for us
+  else if ((!client_ready ||
+            memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
+           (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
+    // If it's a valid IP frame, use it to infer IP <-> MAC mappings
+    if (validate_eth_ip_frame(frame)) {
+      arp_snoop_ip_frame(frame);
+    }
+    // Beyond that, ignore the packet, it's not for us
     // TODO multicast support? Not sure how this works
     if (very_verbose_log && recv_log) {
       logf("net packet for another host (%s)\n",
            ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest));
     }
+  }
 #endif
-  } else if (frame->recv_size > MAX_PACKET_SIZE) {
-    // Ignore packet, too big (extra jumbo frame? We can't handle it)
-    logf("net packet too big (trucated to %lu of %lu bytes)\n",
-         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->recv_size);
-  } else if (!validate_eth_ip_frame(frame)) {
-    // Ignore packet, not valid IP
-    if (verbose_log && recv_log) {
-      logf("net packet not valid (%lu bytes):\n",
+  else if (frame->hdr.h_proto == 0x0806) {
+    // Some kind of ARP frame, take a look see
+    if (arp_process_announce(frame)) {
+      frame = NULL;
+    }
+  } else if (validate_eth_ip_frame(frame)) {
+    // Valid IP frame, intended for us
+    arp_snoop_ip_frame(frame);
+    if (client_ready && net_forward_frame(frame)) {
+      frame = NULL;
+    }
+  } else {
+    // Ignore packet: it's not valid IP
+    if (very_verbose_log && recv_log) {
+      logf("net packet addressed to us but not recognized (%lu bytes):\n",
            (unsigned long)frame->recv_size);
       hex_dump(stdlog, &frame->eth_raw, frame->recv_size);
     }
-  } else {
-    // A complete packet!
-    if (very_verbose_log && recv_log) {
-      char srcaddr[20], destaddr[20];
-      inet_ntop(AF_INET, &frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-      inet_ntop(AF_INET, &frame->ip.hdr.daddr, destaddr, sizeof destaddr);
-      logf(
-          "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
-          "sa=%s, da=%s\n",
-          (unsigned long)frame->recv_size,
-          (unsigned long)ntohs(frame->ip.hdr.tot_len),
-          (int)frame->ip.hdr.protocol, srcaddr, destaddr);
-    }
-    if (!net_process_dhcp_response(frame) && !net_process_arp_request(frame)) {
-      ser_send(frame);
-    }
-    // Don't free frame, it's handed off to the other processors
-    return;
   }
 
-  free_packet_buf(frame);
-}
-
-bool net_process_dhcp_response(struct eth_packet *frame) {
-  (void)frame;
-  return false;
+  if (frame != NULL) {
+    free_packet_buf(frame);
+  }
 }
 
 bool net_process_arp_request(struct eth_packet *frame) {
+  // TODO respond to ARP requests directly
   (void)frame;
   return false;
+}
+
+bool net_process_dhcp_response(struct eth_packet *frame) {
+  // Caller promises this is actually a valid IP packet
+  assert(validate_eth_ip_frame(frame));
+
+  // TODO pick up assigned IP address, then forward
+  (void)frame;
+  return false;
+}
+
+bool net_forward_frame(struct eth_packet *frame) {
+  // Caller promises this is actually a valid IP packet
+  assert(validate_eth_ip_frame(frame));
+
+  // A complete packet and we're ready for it!
+  if (very_verbose_log && recv_log) {
+    char srcaddr[20], destaddr[20];
+    inet_ntop(AF_INET, &frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
+    inet_ntop(AF_INET, &frame->ip.hdr.daddr, destaddr, sizeof destaddr);
+    logf(
+        "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+        "sa=%s, da=%s\n",
+        (unsigned long)frame->recv_size,
+        (unsigned long)ntohs(frame->ip.hdr.tot_len),
+        (int)frame->ip.hdr.protocol, srcaddr, destaddr);
+  }
+
+  // TODO rewrite IP addresses for masquerading if needed
+  // TODO filter in only IP packets actually sent to the client
+
+  // Pass frame on to serial send
+  ser_send(frame);
+  return true;
 }
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
@@ -463,10 +474,10 @@ struct eth_packet *alloc_packet_buf(void) {
         packet_pool_unallocated[packet_pool_unallocated_count];
     assert(result != NULL);
     packet_pool_unallocated[packet_pool_unallocated_count] = NULL;
-    if (very_verbose_log) {
-      logf("alloc buf, %lu available\n",
-           (unsigned long)packet_pool_unallocated_count);
-    }
+    // if (very_verbose_log) {
+    //   logf("alloc buf, %lu available\n",
+    //        (unsigned long)packet_pool_unallocated_count);
+    // }
     return result;
   } else {
     if (very_verbose_log) {
@@ -481,10 +492,10 @@ void free_packet_buf(struct eth_packet *packet) {
   assert(packet_pool_unallocated_count < PACKET_POOL_SIZE);
   packet_pool_unallocated[packet_pool_unallocated_count] = packet;
   ++packet_pool_unallocated_count;
-  if (very_verbose_log) {
-    logf("free buf, %lu available\n",
-         (unsigned long)packet_pool_unallocated_count);
-  }
+  // if (very_verbose_log) {
+  //   logf("free buf, %lu available\n",
+  //        (unsigned long)packet_pool_unallocated_count);
+  // }
 }
 
 int sock_get_ifindex(int fd, char const *dev_name) {

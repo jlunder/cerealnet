@@ -1,20 +1,65 @@
 #include "etherslip.h"
 
+struct eth_packet *ser_read_accum = NULL;
+size_t ser_read_accum_used = 0;
+bool ser_read_accum_esc = false;
+
+uint8_t ser_write_queue[SER_WRITE_QUEUE_SIZE];
+size_t ser_write_queue_head = 0;
+size_t ser_write_queue_tail = 0;
+
+size_t ser_send_head = 0;
+size_t ser_send_tail = 0;
+
+int ser_fd;
+
 void ser_init(char const *ser_dev_name) {
   // TODO enumerate serial devices
   // if (strlen(rx_dev_name) == 0) {
   //   snprintf(rx_dev_name, sizeof rx_dev_name, "wlp3s0");
   // }
-
   if (strlen(ser_dev_name) > 0) {
     ser_fd = open(ser_dev_name, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (ser_fd < 0) {
       perror("open() failed for serial socket");
       exit(1);
     }
+
+    // TODO switches for speed/parity/stop bits/flow control
+    // TODO is there 7-bit SLIP? That must require a whole other mode...
+    struct termios ser_saved_attrs;
+    struct termios ser_attrs;
+    if (tcgetattr(ser_fd, &ser_saved_attrs) != 0) {
+      perror("ser_init failed to save line attributes (tcgetattr)");
+    }
+    cfmakeraw(&ser_attrs);
+    if (cfsetspeed(&ser_attrs, B115200) != 0) {
+      perror("ser_init failed to set desired speed (cfsetspeed)");
+    }
+    ser_attrs.c_cflag &= ~PARENB;
+    ser_attrs.c_cflag &= ~PARODD;
+    ser_attrs.c_cflag &= ~CSTOPB;
+    ser_attrs.c_cflag &= ~CSIZE;
+    ser_attrs.c_cflag |= CS8;
+    ser_attrs.c_cflag &= ~CRTSCTS;
+    // ser_attrs.c_cflag |= CRTSCTS;
+    if (tcsetattr(ser_fd, TCSANOW, &ser_attrs) != 0) {
+      perror("ser_init failed to set line attributes (tcsetattr)");
+    }
   } else {
     ser_fd = -1;
   }
+}
+
+// TODO serial shutdown? atexit?
+
+void ser_setup_pollfd(struct pollfd *pfd) {
+  pfd->fd = ser_fd;
+  pfd->events = POLLIN;
+  if (ser_write_queue_head != ser_write_queue_tail) {
+    pfd->events |= POLLOUT;
+  }
+  pfd->revents = 0;
 }
 
 void ser_read_available(void) {

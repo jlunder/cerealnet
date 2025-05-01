@@ -2,7 +2,10 @@
 
 #if USE_IF_ETH
 
-void eth_init(char const *eth_dev_name, bool force_eth_mac) {
+int eth_socket = -1;
+struct eth_packet *eth_write_queue = NULL;
+
+void eth_init(char const *eth_dev_name) {
   // TODO enumerate ethernet devices
   // if (strlen(tx_dev_name) == 0) {
   //   snprintf(tx_dev_name, sizeof tx_dev_name, "enp0s25");
@@ -15,9 +18,20 @@ void eth_init(char const *eth_dev_name, bool force_eth_mac) {
     exit(1);
   }
 
-  if (!force_eth_mac && strlen(eth_dev_name) > 0) {
-    eth_get_hwaddr(eth_socket, eth_dev_name, &client_mac);
+  if (strlen(eth_dev_name) > 0) {
+    eth_get_hwaddr(eth_socket, eth_dev_name, &host_mac);
+  } else {
+    memcpy(&host_mac, &broadcast_mac, sizeof host_mac);
   }
+}
+
+void eth_setup_pollfd(struct pollfd* pfd) {
+  pfd->fd = eth_socket;
+  pfd->events = POLLIN;
+  if (eth_write_queue != NULL) {
+    pfd->events |= POLLOUT;
+  }
+  pfd->revents = 0;
 }
 
 void eth_read_available(void) {
@@ -54,6 +68,18 @@ void eth_send(struct eth_packet *frame) {
   assert(frame != NULL);
   struct ip_packet *ip_frame = &frame->ip;
   assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(frame)));
+
+  if (!client_ready) {
+    // We need a MAC address to send, but if we're not ready it's uninitialized
+    if (verbose_log) {
+      logf("client sending while not ready, dropping packet\n");
+    }
+    return;
+  }
+
+  // Rewrite ethernet source and dest addresses
+  memcpy(&frame->hdr.h_source, &client_mac, sizeof(struct ether_addr));
+  memcpy(&frame->hdr.h_dest, &broadcast_mac, sizeof(struct ether_addr));
 
   if (very_verbose_log && send_log) {
     logf("eth_send packet:\n");

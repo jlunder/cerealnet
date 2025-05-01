@@ -2,6 +2,10 @@
 
 #if USE_IF_PKT
 
+int pkt_send_socket = -1;
+int pkt_recv_socket = -1;
+struct eth_packet *pkt_write_queue = NULL;
+
 void pkt_init(void) {
   pkt_send_socket = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
   if (pkt_send_socket < 0) {
@@ -29,6 +33,15 @@ void pkt_init(void) {
   //   perror("setsockopt");
   //   exit(1);
   // }
+}
+
+void ser_setup_pollfd(struct pollfd *pfd) {
+  pfd->fd = pkt_recv_socket;
+  pfd->events = POLLIN;
+  if (pkt_write_queue != NULL) {
+    pfd->events |= POLLOUT;
+  }
+  pfd->revents = 0;
 }
 
 void pkt_read_available(void) {

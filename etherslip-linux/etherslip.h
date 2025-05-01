@@ -24,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -36,7 +37,7 @@
 #endif
 
 #if USE_IF_PKT == USE_IF_ETH
-#error "Only one of IF_USE_PKT or IF_USE_ETH, please"
+#error "Exactly one of USE_IF_PKT or USE_IF_ETH, please"
 #endif
 
 #ifndef stdlog
@@ -73,10 +74,10 @@ struct dhcp_msg {
   uint32_t xid;
   uint16_t secs;
   uint16_t flags;
-  uint32_t ciaddr;
-  uint32_t yiaddr;
-  uint32_t siaddr;
-  uint32_t giaddr;
+  struct in_addr ciaddr;
+  struct in_addr yiaddr;
+  struct in_addr siaddr;
+  struct in_addr giaddr;
   uint8_t chaddr[16];
   uint8_t sname[64];
   uint8_t file[128];
@@ -84,14 +85,16 @@ struct dhcp_msg {
 } __attribute__((packed));
 
 struct arp_msg {
-  uint16_t hrd;  // 1 or 6?
-  uint16_t pro;  // ETH_P_IP
+  uint16_t hrd;  // 1 or 6? -- hardware type
+  uint16_t pro;  // 0x800 = ETH_P_IP -- protocol type
   uint8_t hln;   // 6 -- MAC len
   uint8_t pln;   // 4 -- IPv4 address len
   uint16_t op;   // 1=ARP req, rep, 3=RARP req, rep, 5=DRARP req, rep, err,
                  // 8=InARP req, rep
-  uint8_t addrs[255 * 4];
-  // sha, spa, tha, tpa
+  struct ether_addr sha;
+  struct in_addr spa;
+  struct ether_addr tha;
+  struct in_addr tpa;
 } __attribute__((packed));
 
 struct ip_packet {
@@ -102,7 +105,6 @@ struct ip_packet {
         uint8_t ip_payload[MAX_PACKET_SIZE - sizeof(struct iphdr) -
                            sizeof(struct ethhdr)];
         struct dhcp_msg dhcp;
-        struct arp_msg arp;
       };
     } __attribute__((packed));
     uint8_t ip_raw[MAX_PACKET_SIZE - sizeof(struct ethhdr)];
@@ -115,17 +117,21 @@ struct eth_packet {
       struct ethhdr hdr;
       struct ip_packet ip;
     } __attribute__((packed));
+    struct arp_msg arp;
     uint8_t eth_raw[MAX_PACKET_SIZE];
   };
   size_t recv_size;
 } __attribute__((packed));
 
-#define ETH_IP_SIZE(eth_frame) (eth_frame->recv_size - sizeof(struct ethhdr))
+#define ETH_IP_SIZE(frame) (frame->recv_size - sizeof(struct ethhdr))
 
 extern bool recv_log;
 extern bool send_log;
 extern bool verbose_log;
 extern bool very_verbose_log;
+
+extern bool client_ready;
+extern uint32_t ser_bps;
 
 // Round up to align to 16 bytes
 #define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
@@ -135,29 +141,9 @@ extern struct eth_packet packet_pool[PACKET_POOL_SIZE];
 extern struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 extern size_t packet_pool_unallocated_count;
 
-extern struct eth_packet *ser_read_accum;
-extern size_t ser_read_accum_used;
-extern bool ser_read_accum_esc;
-
-extern uint8_t ser_write_queue[SER_WRITE_QUEUE_SIZE];
-extern size_t ser_write_queue_head;
-extern size_t ser_write_queue_tail;
-
-extern int ser_fd;
-
-#if USE_IF_ETH
-extern int eth_socket;
-extern struct eth_packet *eth_write_queue;
-#endif
-
-#if USE_IF_PKT
-extern int pkt_send_socket;
-extern int pkt_recv_socket;
-extern struct eth_packet *pkt_write_queue;
-#endif
-
 // the MAC address we're applying to packets bridged from the SLIP interface
 extern struct ether_addr client_mac;
+extern struct ether_addr host_mac;
 extern struct ether_addr broadcast_mac;
 
 void parse_args(int argc, char *argv[]);
@@ -167,22 +153,36 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
 
 void poll_loop(void);
 
-void client_process_frame(struct eth_packet *eth_frame);
-bool client_process_dhcp_request(struct eth_packet *eth_frame);
-void net_process_frame(struct eth_packet *eth_frame);
-bool net_process_dhcp_response(struct eth_packet *eth_frame);
-bool net_process_arp_request(struct eth_packet *eth_frame);
+void client_process_frame(struct eth_packet *frame);
+bool client_forward_frame(struct eth_packet *frame);
+
+void net_process_frame(struct eth_packet *frame);
+bool net_forward_frame(struct eth_packet *frame);
+bool net_send_arp_frame(struct eth_packet *frame);
+
+bool arp_process_request(struct eth_packet *frame);
+bool arp_process_announce(struct eth_packet *frame);
+void arp_snoop_ip_frame(struct eth_packet const *frame);
+bool arp_fetch_address(struct in_addr const *ip_addr,
+                       struct ether_addr *found_eth_addr);
+bool arp_announce(struct in_addr const *ip_addr,
+                  struct ether_addr *found_eth_addr);
+
+// bool dhcp_snoop_request(struct eth_packet *frame);
+// bool dhcp_snoop_response(struct eth_packet *frame);
 
 void ser_init(char const *ser_dev_name);
+void ser_setup_pollfd(struct pollfd *pfd);
 void ser_read_available(void);
 void ser_accumulate_bytes(uint8_t *data, size_t size);
-void ser_send(struct eth_packet *eth_frame);
+void ser_send(struct eth_packet *frame);
 void ser_try_write_all_queued(void);
 
 #if USE_IF_ETH
-void eth_init(char const *eth_dev_name, bool force_eth_mac);
+void eth_init(char const *eth_dev_name);
+void eth_setup_pollfd(struct pollfd *pfd);
 void eth_read_available(void);
-void eth_send(struct eth_packet *eth_frame);
+void eth_send(struct eth_packet *frame);
 void eth_try_write_all_queued(void);
 
 void eth_get_hwaddr(int eth_socket, char const *dev_name,
@@ -191,14 +191,15 @@ void eth_get_hwaddr(int eth_socket, char const *dev_name,
 
 #if USE_IF_PKT
 void pkt_init(void);
+void pkt_setup_pollfd(struct pollfd *pfd);
 void pkt_read_available(void);
-void pkt_send(struct eth_packet *eth_frame);
+void pkt_send(struct eth_packet *frame);
 void pkt_try_write_all_queued(void);
 #endif
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size);
-bool validate_eth_ip_frame(struct eth_packet const *eth_frame);
+bool validate_eth_ip_frame(struct eth_packet const *frame);
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size);
 
 struct eth_packet *alloc_packet_buf(void);

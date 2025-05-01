@@ -27,11 +27,22 @@
 #include <time.h>
 #include <unistd.h>
 
-#if !defined(USE_IF_PKT) && !defined(USE_IF_ETH)
-#define USE_IF_PKT
+#ifndef USE_IF_ETH
+#define USE_IF_ETH 1
 #endif
 
+#ifndef USE_IF_PKT
+#define USE_IF_PKT (!USE_IF_ETH)
+#endif
+
+#if USE_IF_PKT == USE_IF_ETH
+#error "Only one of IF_USE_PKT or IF_USE_ETH, please"
+#endif
+
+#ifndef stdlog
 #define stdlog stderr
+#endif
+
 #define logf(...) fprintf(stdlog, __VA_ARGS__)
 
 // big enough for a 9k jumbo frame
@@ -39,10 +50,10 @@
 #define PACKET_POOL_SIZE 6
 
 #define SER_IDX 0
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
 #define ETH_IDX 1
 #endif
-#ifdef USE_IF_PKT
+#if USE_IF_PKT
 #define PKT_IDX 1
 #endif
 #define FDS_SIZE 2
@@ -105,12 +116,14 @@ struct eth_packet {
       struct ip_packet ip;
     } __attribute__((packed));
     uint8_t eth_raw[MAX_PACKET_SIZE];
-    size_t recv_size;
   };
+  size_t recv_size;
 } __attribute__((packed));
 
 #define ETH_IP_SIZE(eth_frame) (eth_frame->recv_size - sizeof(struct ethhdr))
 
+extern bool recv_log;
+extern bool send_log;
 extern bool verbose_log;
 extern bool very_verbose_log;
 
@@ -132,12 +145,12 @@ extern size_t ser_write_queue_tail;
 
 extern int ser_fd;
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
 extern int eth_socket;
 extern struct eth_packet *eth_write_queue;
 #endif
 
-#ifdef USE_IF_PKT
+#if USE_IF_PKT
 extern int pkt_send_socket;
 extern int pkt_recv_socket;
 extern struct eth_packet *pkt_write_queue;
@@ -166,7 +179,7 @@ void ser_accumulate_bytes(uint8_t *data, size_t size);
 void ser_send(struct eth_packet *eth_frame);
 void ser_try_write_all_queued(void);
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
 void eth_init(char const *eth_dev_name, bool force_eth_mac);
 void eth_read_available(void);
 void eth_send(struct eth_packet *eth_frame);
@@ -176,7 +189,7 @@ void eth_get_hwaddr(int eth_socket, char const *dev_name,
                     struct ether_addr *hwaddr);
 #endif
 
-#ifdef USE_IF_PKT
+#if USE_IF_PKT
 void pkt_init(void);
 void pkt_read_available(void);
 void pkt_send(struct eth_packet *eth_frame);

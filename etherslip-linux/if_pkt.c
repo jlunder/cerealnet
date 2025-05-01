@@ -1,6 +1,6 @@
 #include "etherslip.h"
 
-#ifdef USE_IF_PKT
+#if USE_IF_PKT
 
 void pkt_init(void) {
   pkt_send_socket = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
@@ -34,8 +34,8 @@ void pkt_init(void) {
 void pkt_read_available(void) {
   // Try reading the ethernet interface -- despite the name it's okay to stop
   // at reading/processing a single packet
-  struct eth_packet *eth_frame = alloc_packet_buf();
-  if (eth_frame == NULL) {
+  struct eth_packet *frame = alloc_packet_buf();
+  if (frame == NULL) {
     logf("eth packet alloc failed!\n");
     return;
   }
@@ -44,9 +44,9 @@ void pkt_read_available(void) {
   socklen_t packet_addr_len = sizeof packet_addr;
   ssize_t recv_size;
 
-  assert(sizeof *eth_frame == MAX_PACKET_SIZE);
+  assert(sizeof frame->eth_raw == MAX_PACKET_SIZE);
   recv_size =
-      recvfrom(pkt_recv_socket, &eth_frame->ip, sizeof eth_frame->ip.ip_raw,
+      recvfrom(pkt_recv_socket, &frame->ip, sizeof frame->ip.ip_raw,
                MSG_DONTWAIT, (struct sockaddr *)&packet_addr, &packet_addr_len);
   if (recv_size < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
@@ -55,25 +55,25 @@ void pkt_read_available(void) {
       perror("recvfrom failed");
       exit(1);
     }
-    free_packet_buf(eth_frame);
+    free_packet_buf(frame);
   } else {
-    memcpy(&eth_frame->hdr.h_dest, &client_mac, sizeof(struct ether_addr));
-    memcpy(&eth_frame->hdr.h_source, &broadcast_mac, sizeof(struct ether_addr));
-    eth_frame->hdr.h_proto = ETH_P_IP;
+    memcpy(&frame->hdr.h_dest, &client_mac, sizeof(struct ether_addr));
+    memcpy(&frame->hdr.h_source, &broadcast_mac, sizeof(struct ether_addr));
+    frame->hdr.h_proto = ETH_P_IP;
 
-    eth_frame->recv_size = sizeof(struct ethhdr) + recv_size;
-    net_process_frame(eth_frame);
+    frame->recv_size = sizeof(struct ethhdr) + recv_size;
+    net_process_frame(frame);
   }
 }
 
-void pkt_send(struct eth_packet *eth_frame) {
-  assert(eth_frame != NULL);
-  struct ip_packet *ip_frame = &eth_frame->ip;
-  assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(eth_frame)));
+void pkt_send(struct eth_packet *frame) {
+  assert(frame != NULL);
+  struct ip_packet *ip_frame = &frame->ip;
+  assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(frame)));
 
-  if (very_verbose_log) {
+  if (very_verbose_log && send_log) {
     logf("pkt_send packet:\n");
-    hex_dump(stdlog, &eth_frame->ip, ntohs(eth_frame->ip.hdr.tot_len));
+    hex_dump(stdlog, &frame->ip, ntohs(frame->ip.hdr.tot_len));
   }
 
   if (pkt_write_queue != NULL) {
@@ -82,7 +82,7 @@ void pkt_send(struct eth_packet *eth_frame) {
     }
     free_packet_buf(pkt_write_queue);
   }
-  pkt_write_queue = eth_frame;
+  pkt_write_queue = frame;
   pkt_try_write_all_queued();
 }
 
@@ -92,11 +92,25 @@ void pkt_try_write_all_queued(void) {
   }
 
   ssize_t res;
-  struct sockaddr_ll dest_sa;
+  struct sockaddr_in dest_sa;
   memset(&dest_sa, 0, sizeof dest_sa);
-  dest_sa.sll_family = AF_PACKET;
-  dest_sa.sll_halen = ETH_ALEN;
-  memcpy(&dest_sa, pkt_write_queue->hdr.h_dest, ETH_ALEN);
+  dest_sa.sin_family = AF_INET;
+  memcpy(&dest_sa.sin_addr, &pkt_write_queue->ip.hdr.daddr,
+         sizeof dest_sa.sin_addr);
+  dest_sa.sin_port = 0;
+  if (very_verbose_log && send_log) {
+    char srcaddr[20], destaddr[20];
+    inet_ntop(AF_INET, &pkt_write_queue->ip.hdr.saddr, srcaddr, sizeof srcaddr);
+    inet_ntop(AF_INET, &pkt_write_queue->ip.hdr.daddr, destaddr,
+              sizeof destaddr);
+    logf(
+        "pkt write queued frame, %lu bytes, dest mac=%s; "
+        "hdr tot_len=%lu, proto=%02X, sa=%s, da=%s\n",
+        (unsigned long)pkt_write_queue->recv_size,
+        ether_ntoa((struct ether_addr const *)&pkt_write_queue->hdr.h_dest),
+        (unsigned long)ntohs(pkt_write_queue->ip.hdr.tot_len),
+        (int)pkt_write_queue->ip.hdr.protocol, srcaddr, destaddr);
+  }
   res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->recv_size,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);
   if (res < 0) {

@@ -142,12 +142,12 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
   ser_read_accum_esc = esc;
 }
 
-void ser_send(struct eth_packet *eth_frame) {
-  assert(eth_frame != NULL);
-  struct ip_packet *ip_frame = &eth_frame->ip;
-  assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(eth_frame)));
+void ser_send(struct eth_packet *frame) {
+  assert(frame != NULL);
+  struct ip_packet *ip_frame = &frame->ip;
+  assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(frame)));
 
-  if (very_verbose_log) {
+  if (very_verbose_log && recv_log) {
     logf("ser_send packet:\n");
     hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
   }
@@ -203,6 +203,8 @@ void ser_send(struct eth_packet *eth_frame) {
 
   ser_write_queue_tail = 0;
   ser_write_queue_head = j;
+
+  free_packet_buf(frame);
 
   // logf("SLIP encoded:\n");
   // hex_dump(stdlog, ser_write_queue, j);

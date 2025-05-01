@@ -1,5 +1,7 @@
 #include "etherslip.h"
 
+bool recv_log = false;
+bool send_log = false;
 bool verbose_log = false;
 bool very_verbose_log = false;
 
@@ -20,15 +22,15 @@ size_t ser_send_tail = 0;
 
 int ser_fd;
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
 int eth_socket = -1;
 struct eth_packet *eth_write_queue = NULL;
-#endif
-
-#ifdef USE_IF_PKT
+#elif USE_IF_PKT
 int pkt_send_socket = -1;
 int pkt_recv_socket = -1;
 struct eth_packet *pkt_write_queue = NULL;
+#else
+#error "Must specify an interface type"
 #endif
 
 struct ether_addr client_mac;
@@ -50,7 +52,7 @@ int main(int argc, char *argv[]) {
 
 void parse_args(int argc, char *argv[]) {
   char ser_dev_name[PATH_MAX] = "";
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
   char eth_dev_name[IFNAMSIZ] = "";
   struct ether_addr const *tmp_mac;
   bool force_eth_mac = false;
@@ -59,18 +61,19 @@ void parse_args(int argc, char *argv[]) {
   int opt;
   while ((opt = getopt(argc, argv,
                        "s:"
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
                        "e:m:"
+#elif USE_IF_PKT
+#else
+#error "Must specify an interface type"
 #endif
-#ifdef USE_IF_PKT
-#endif
-                       "vh")) != -1) {
+                       "RSvh")) != -1) {
     switch (opt) {
       case 's': {
         snprintf(ser_dev_name, PATH_MAX, "%s", optarg);
       } break;
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
       case 'm': {
         force_eth_mac = true;
         if ((tmp_mac = ether_aton(optarg)) == NULL) {
@@ -81,9 +84,9 @@ void parse_args(int argc, char *argv[]) {
       case 'e': {
         snprintf(eth_dev_name, IFNAMSIZ, "%s", optarg);
       } break;
-#endif
-
-#ifdef USE_IF_PKT
+#elif USE_IF_PKT
+#else
+#error "Must specify an interface type"
 #endif
 
 #if 0
@@ -108,6 +111,12 @@ void parse_args(int argc, char *argv[]) {
       } break;
 #endif
 
+      case 'R': {
+        recv_log = true;
+      } break;
+      case 'S': {
+        send_log = true;
+      } break;
       case 'v': {
         if (verbose_log) {
           very_verbose_log = true;
@@ -125,12 +134,12 @@ void parse_args(int argc, char *argv[]) {
   }
 
   ser_init(ser_dev_name);
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
   eth_init(eth_dev_name, force_eth_mac);
-#endif
-
-#ifdef USE_IF_PKT
+#elif USE_IF_PKT
   pkt_init();
+#else
+#error "Must specify an interface type"
 #endif
 }
 
@@ -142,11 +151,11 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
   logf(
       "Usage: %s [-s SERIALDEV]"
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
       " [-e ETHDEV] [-m MAC ]"
-#endif
-
-#ifdef USE_IF_PKT
+#elif USE_IF_PKT
+#else
+#error "Must specify an interface type"
 #endif
 
       "\n",
@@ -168,22 +177,22 @@ void poll_loop(void) {
     }
     poll_fds[SER_IDX].revents = 0;
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
     poll_fds[ETH_IDX].fd = eth_socket;
     poll_fds[ETH_IDX].events = POLLIN;
     if (eth_write_queue != NULL) {
       poll_fds[ETH_IDX].events |= POLLOUT;
     }
     poll_fds[ETH_IDX].revents = 0;
-#endif
-
-#ifdef USE_IF_PKT
+#elif USE_IF_PKT
     poll_fds[PKT_IDX].fd = pkt_recv_socket;
     poll_fds[PKT_IDX].events = POLLIN;
     if (pkt_write_queue != NULL) {
       poll_fds[PKT_IDX].events |= POLLOUT;
     }
     poll_fds[PKT_IDX].revents = 0;
+#else
+#error "Must specify an interface type"
 #endif
 
     int poll_res = poll(poll_fds, FDS_SIZE, 100);
@@ -228,7 +237,7 @@ void poll_loop(void) {
         ser_read_available();
       }
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
       // Check for errors
       if ((poll_fds[ETH_IDX].revents & ~POLLIN) != 0) {
         int re = poll_fds[ETH_IDX].revents;
@@ -241,9 +250,7 @@ void poll_loop(void) {
       if ((poll_fds[ETH_IDX].revents & POLLIN) != 0) {
         eth_read_available();
       }
-#endif
-
-#ifdef USE_IF_PKT
+#elif USE_IF_PKT
       // Check for errors
       if ((poll_fds[PKT_IDX].revents & ~POLLIN) != 0) {
         int re = poll_fds[PKT_IDX].revents;
@@ -256,37 +263,39 @@ void poll_loop(void) {
       if ((poll_fds[PKT_IDX].revents & POLLIN) != 0) {
         pkt_read_available();
       }
+#else
+#error "Must specify an interface type"
 #endif
 
       ser_try_write_all_queued();
 
-#ifdef USE_IF_ETH
+#if USE_IF_ETH
       eth_try_write_all_queued();
-#endif
-
-#ifdef USE_IF_PKT
+#elif USE_IF_PKT
       pkt_try_write_all_queued();
+#else
+#error "Must specify an interface type"
 #endif
     }
   }
 }
 
-void client_process_frame(struct eth_packet *eth_frame) {
-  if (eth_frame->recv_size < sizeof(struct ethhdr)) {
+void client_process_frame(struct eth_packet *frame) {
+  if (frame->recv_size < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
-    if (verbose_log) {
+    if (verbose_log && send_log) {
       logf("client packet runt frame (%lu bytes)\n",
-           (unsigned long)eth_frame->recv_size);
+           (unsigned long)frame->recv_size);
     }
-  } else if (!validate_ip_frame(&eth_frame->ip, ETH_IP_SIZE(eth_frame))) {
+  } else if (!validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame))) {
     // Ignore packet, not valid IP
-    if (verbose_log) {
+    if (verbose_log && send_log) {
       logf("client packet not valid (%lu bytes):\n",
-           (unsigned long)ETH_IP_SIZE(eth_frame));
-      hex_dump(stdlog, ser_read_accum->ip.ip_raw, ETH_IP_SIZE(eth_frame));
+           (unsigned long)ETH_IP_SIZE(frame));
+      hex_dump(stdlog, ser_read_accum->ip.ip_raw, ETH_IP_SIZE(frame));
     }
   } else {
-    if (very_verbose_log) {
+    if (very_verbose_log && send_log) {
       char srcaddr[20], destaddr[20];
       inet_ntop(AF_INET, &ser_read_accum->ip.hdr.saddr, srcaddr,
                 sizeof srcaddr);
@@ -295,7 +304,7 @@ void client_process_frame(struct eth_packet *eth_frame) {
       logf(
           "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
           "sa=%s, da=%s\n",
-          (unsigned long)ETH_IP_SIZE(eth_frame),
+          (unsigned long)ETH_IP_SIZE(frame),
           (unsigned long)ntohs(ser_read_accum->ip.hdr.tot_len),
           (int)ser_read_accum->ip.hdr.protocol, srcaddr, destaddr);
     }
@@ -303,76 +312,81 @@ void client_process_frame(struct eth_packet *eth_frame) {
     memcpy(&ser_read_accum->hdr.h_source, &broadcast_mac,
            sizeof(struct ether_addr));
     ser_read_accum->hdr.h_proto = ETH_P_IP;
-    if (!client_process_dhcp_request(eth_frame)) {
-      pkt_send(eth_frame);
+    if (!client_process_dhcp_request(frame)) {
+#if USE_IF_ETH
+      eth_send(frame);
+#elif USE_IF_PKT
+#else
+      pkt_send(frame);
+#error "Must specify an interface type"
+#endif
     }
   }
 }
 
-bool client_process_dhcp_request(struct eth_packet *eth_frame) {
-  (void)eth_frame;
+bool client_process_dhcp_request(struct eth_packet *frame) {
+  (void)frame;
   return false;
 }
 
-void net_process_frame(struct eth_packet *eth_frame) {
-  if (eth_frame->recv_size < sizeof(struct ethhdr)) {
+void net_process_frame(struct eth_packet *frame) {
+  if (frame->recv_size < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
-    if (verbose_log) {
+    if (verbose_log && recv_log) {
       logf("net packet runt frame (%lu bytes)\n",
-           (unsigned long)eth_frame->recv_size);
+           (unsigned long)frame->recv_size);
     }
-#ifdef IF_USE_ETH
-  } else if ((memcmp(&eth_frame->hdr.h_dest, &eth_mac, ETH_ALEN) != 0) &&
-             (memcmp(&eth_frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
+#if USE_IF_ETH
+  } else if ((memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
+             (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
     // Ignore packet, not for us
     // TODO multicast support? Not sure how this works
-    if (very_verbose_log) {
+    if (very_verbose_log && recv_log) {
       logf("net packet for another host (%s)\n",
-           ether_ntoa((struct ether_addr const *)&eth_frame->hdr.h_dest));
+           ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest));
     }
 #endif
-  } else if (eth_frame->recv_size > MAX_PACKET_SIZE) {
+  } else if (frame->recv_size > MAX_PACKET_SIZE) {
     // Ignore packet, too big (extra jumbo frame? We can't handle it)
     logf("net packet too big (trucated to %lu of %lu bytes)\n",
-         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)eth_frame->recv_size);
-  } else if (!validate_eth_ip_frame(eth_frame)) {
+         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->recv_size);
+  } else if (!validate_eth_ip_frame(frame)) {
     // Ignore packet, not valid IP
-    if (verbose_log) {
+    if (verbose_log && recv_log) {
       logf("net packet not valid (%lu bytes):\n",
-           (unsigned long)eth_frame->recv_size);
-      hex_dump(stdlog, &eth_frame->eth_raw, eth_frame->recv_size);
+           (unsigned long)frame->recv_size);
+      hex_dump(stdlog, &frame->eth_raw, frame->recv_size);
     }
   } else {
     // A complete packet!
-    if (very_verbose_log) {
+    if (very_verbose_log && recv_log) {
       char srcaddr[20], destaddr[20];
-      inet_ntop(AF_INET, &eth_frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-      inet_ntop(AF_INET, &eth_frame->ip.hdr.daddr, destaddr, sizeof destaddr);
+      inet_ntop(AF_INET, &frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
+      inet_ntop(AF_INET, &frame->ip.hdr.daddr, destaddr, sizeof destaddr);
       logf(
           "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
           "sa=%s, da=%s\n",
-          (unsigned long)eth_frame->recv_size,
-          (unsigned long)ntohs(eth_frame->ip.hdr.tot_len),
-          (int)eth_frame->ip.hdr.protocol, srcaddr, destaddr);
+          (unsigned long)frame->recv_size,
+          (unsigned long)ntohs(frame->ip.hdr.tot_len),
+          (int)frame->ip.hdr.protocol, srcaddr, destaddr);
     }
-    if (!net_process_dhcp_response(eth_frame) &&
-        !net_process_arp_request(eth_frame)) {
-      ser_send(eth_frame);
+    if (!net_process_dhcp_response(frame) && !net_process_arp_request(frame)) {
+      ser_send(frame);
     }
-    // Don't free eth_frame, it's handed off to the other processors
+    // Don't free frame, it's handed off to the other processors
     return;
   }
 
-  free_packet_buf(eth_frame);
+  free_packet_buf(frame);
 }
 
-bool net_process_dhcp_response(struct eth_packet *eth_frame) {
-  (void)eth_frame;
+bool net_process_dhcp_response(struct eth_packet *frame) {
+  (void)frame;
   return false;
 }
 
-bool net_process_arp_request(struct eth_packet *eth_frame) {
-  (void)eth_frame;
+bool net_process_arp_request(struct eth_packet *frame) {
+  (void)frame;
   return false;
 }
 
@@ -390,10 +404,10 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
   return ~checksum & 0xFFFF;
 }
 
-bool validate_eth_ip_frame(struct eth_packet const *eth_frame) {
-  uint16_t proto = ntohs(eth_frame->hdr.h_proto);
+bool validate_eth_ip_frame(struct eth_packet const *frame) {
+  uint16_t proto = ntohs(frame->hdr.h_proto);
 
-  if (eth_frame->recv_size < sizeof(struct ethhdr)) {
+  if (frame->recv_size < sizeof(struct ethhdr)) {
     return false;
   }
   if (proto < ETH_P_802_3_MIN) {
@@ -404,7 +418,7 @@ bool validate_eth_ip_frame(struct eth_packet const *eth_frame) {
   if (proto != ETH_P_IP) {
     return false;
   }
-  return validate_ip_frame(&eth_frame->ip, ETH_IP_SIZE(eth_frame));
+  return validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame));
 }
 
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {
@@ -449,8 +463,15 @@ struct eth_packet *alloc_packet_buf(void) {
         packet_pool_unallocated[packet_pool_unallocated_count];
     assert(result != NULL);
     packet_pool_unallocated[packet_pool_unallocated_count] = NULL;
+    if (very_verbose_log) {
+      logf("alloc buf, %lu available\n",
+           (unsigned long)packet_pool_unallocated_count);
+    }
     return result;
   } else {
+    if (very_verbose_log) {
+      logf("alloc buf fail, none available\n");
+    }
     return NULL;
   }
 }
@@ -460,6 +481,10 @@ void free_packet_buf(struct eth_packet *packet) {
   assert(packet_pool_unallocated_count < PACKET_POOL_SIZE);
   packet_pool_unallocated[packet_pool_unallocated_count] = packet;
   ++packet_pool_unallocated_count;
+  if (very_verbose_log) {
+    logf("free buf, %lu available\n",
+         (unsigned long)packet_pool_unallocated_count);
+  }
 }
 
 int sock_get_ifindex(int fd, char const *dev_name) {

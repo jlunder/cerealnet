@@ -72,7 +72,7 @@ void pkt_read_available(void) {
   } else {
     memcpy(&frame->hdr.h_dest, &client_mac, sizeof(struct ether_addr));
     memcpy(&frame->hdr.h_source, &broadcast_mac, sizeof(struct ether_addr));
-    frame->hdr.h_proto = ETH_P_IP;
+    frame->hdr.h_proto = htons(ETH_P_IP);
 
     frame->recv_size = sizeof(struct ethhdr) + recv_size;
     net_process_frame(frame);
@@ -98,6 +98,8 @@ void pkt_send(struct eth_packet *frame) {
   pkt_write_queue = frame;
   pkt_try_write_all_queued();
 }
+
+bool pkt_has_work(void) { return pkt_write_queue != NULL; }
 
 void pkt_try_write_all_queued(void) {
   if (pkt_write_queue == NULL) {

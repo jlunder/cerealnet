@@ -1,12 +1,16 @@
 #include "etherslip.h"
 
+// Round up to align to 16 bytes
+#define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
+#define SER_WRITE_QUEUE_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
+
 struct eth_packet *ser_read_accum = NULL;
 size_t ser_read_accum_used = 0;
 bool ser_read_accum_esc = false;
 
-uint8_t ser_write_queue[SER_WRITE_QUEUE_SIZE];
-size_t ser_write_queue_head = 0;
-size_t ser_write_queue_tail = 0;
+uint8_t ser_write_buf[SER_WRITE_QUEUE_SIZE];
+size_t ser_write_buf_head = 0;
+size_t ser_write_buf_tail = 0;
 
 size_t ser_send_head = 0;
 size_t ser_send_tail = 0;
@@ -56,7 +60,7 @@ void ser_init(char const *ser_dev_name) {
 void ser_setup_pollfd(struct pollfd *pfd) {
   pfd->fd = ser_fd;
   pfd->events = POLLIN;
-  if (ser_write_queue_head != ser_write_queue_tail) {
+  if (ser_write_buf_head != ser_write_buf_tail) {
     pfd->events |= POLLOUT;
   }
   pfd->revents = 0;
@@ -204,7 +208,7 @@ void ser_send(struct eth_packet *frame) {
   assert(j + 1 <= SER_WRITE_QUEUE_SIZE);
   // Send an initial END character to flush out any data that may have
   // accumulated in the receiver due to line noise
-  ser_write_queue[j++] = SLIP_END;
+  ser_write_buf[j++] = SLIP_END;
   while (i < size) {
     uint8_t c = ip_frame->ip_raw[i];
     switch (c) {
@@ -212,8 +216,8 @@ void ser_send(struct eth_packet *frame) {
       // character code so as not to make the receiver think we sent an END
       case SLIP_END: {
         assert(j + 2 <= SER_WRITE_QUEUE_SIZE);
-        ser_write_queue[j++] = SLIP_ESC;
-        ser_write_queue[j++] = SLIP_ESC_END;
+        ser_write_buf[j++] = SLIP_ESC;
+        ser_write_buf[j++] = SLIP_ESC_END;
         ++i;
       } break;
 
@@ -221,8 +225,8 @@ void ser_send(struct eth_packet *frame) {
       // character code so as not to make the receiver think we sent an ESC
       case SLIP_ESC: {
         assert(j + 2 <= SER_WRITE_QUEUE_SIZE);
-        ser_write_queue[j++] = SLIP_ESC;
-        ser_write_queue[j++] = SLIP_ESC_ESC;
+        ser_write_buf[j++] = SLIP_ESC;
+        ser_write_buf[j++] = SLIP_ESC_ESC;
         ++i;
       } break;
 
@@ -237,52 +241,56 @@ void ser_send(struct eth_packet *frame) {
         }
         size_t amount = k - i;
         assert(j + amount <= SER_WRITE_QUEUE_SIZE);
-        memcpy(ser_write_queue + j, ip_frame->ip_raw + i, amount);
+        memcpy(ser_write_buf + j, ip_frame->ip_raw + i, amount);
         i = k;
         j += amount;
       } break;
     }
   }
   assert(j + 1 <= SER_WRITE_QUEUE_SIZE);
-  ser_write_queue[j++] = SLIP_END;
+  ser_write_buf[j++] = SLIP_END;
 
-  ser_write_queue_tail = 0;
-  ser_write_queue_head = j;
+  ser_write_buf_tail = 0;
+  ser_write_buf_head = j;
 
   free_packet_buf(frame);
 
   // logf("SLIP encoded:\n");
-  // hex_dump(stdlog, ser_write_queue, j);
+  // hex_dump(stdlog, ser_write_buf, j);
   ser_try_write_all_queued();
 }
 
+bool ser_has_work(void) {
+  return ser_write_buf_tail != ser_write_buf_head;
+}
+
 void ser_try_write_all_queued(void) {
-  if (ser_write_queue_tail == ser_write_queue_head) {
+  if (ser_write_buf_tail == ser_write_buf_head) {
     return;
   }
 
   if (ser_fd == -1) {
-    ser_write_queue_head = 0;
-    ser_write_queue_tail = 0;
+    ser_write_buf_head = 0;
+    ser_write_buf_tail = 0;
     return;
   }
 
   // Write the buffer to the serial port
-  ssize_t amount = ser_write_queue_head - ser_write_queue_tail;
+  ssize_t amount = ser_write_buf_head - ser_write_buf_tail;
   ssize_t result =
-      write(ser_fd, ser_write_queue + ser_write_queue_tail, (size_t)amount);
+      write(ser_fd, ser_write_buf + ser_write_buf_tail, (size_t)amount);
 
   if (result < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
       return;
     }
     perror("write to ser failed");
-    ser_write_queue_head = 0;
-    ser_write_queue_tail = 0;
+    ser_write_buf_head = 0;
+    ser_write_buf_tail = 0;
   } else if (result == amount) {
-    ser_write_queue_head = 0;
-    ser_write_queue_tail = 0;
+    ser_write_buf_head = 0;
+    ser_write_buf_tail = 0;
   } else {
-    ser_write_queue_tail += result;
+    ser_write_buf_tail += result;
   }
 }

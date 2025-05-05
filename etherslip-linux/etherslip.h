@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <net/if.h>
+#include <net/if_arp.h>
+#include <net/if_slip.h>
 #include <netinet/ether.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
@@ -27,6 +29,32 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__STDC__) && defined(__STDC_VERSION__)
+
+#if __STDC_VERSION__ < 201112L
+
+// Adapted from https://stackoverflow.com/a/807586 (Stephen C. Steel)
+
+// combine arguments (after expanding arguments)
+#define GLUE(a, b) __GLUE(a, b)
+#define __GLUE(a, b) a##b
+#define static_assert(expr) \
+  typedef char GLUE(compiler_verify_, __COUNTER__)[(expr) ? (+1) : (-1)]
+
+#elif __STDC_VERSION__ < 202311L
+
+#ifdef static_assert
+#undef static_assert
+#endif
+
+#define static_assert(x) _Static_assert(x, #x)
+
+#else
+// do nothing -- static_assert should be properly defined already
+#endif
+
+#endif
 
 #ifndef USE_IF_ETH
 #define USE_IF_ETH 1
@@ -123,7 +151,13 @@ struct eth_packet {
   size_t recv_size;
 } __attribute__((packed));
 
+static_assert(sizeof (struct ethhdr) == ETH_HLEN);
+
+typedef uint32_t time_ms_t;
+
 #define ETH_IP_SIZE(frame) (frame->recv_size - sizeof(struct ethhdr))
+
+static struct in_addr const this_host_ip_address = {0x00000000};
 
 extern bool recv_log;
 extern bool send_log;
@@ -133,9 +167,7 @@ extern bool very_verbose_log;
 extern bool client_ready;
 extern uint32_t ser_bps;
 
-// Round up to align to 16 bytes
-#define MAX_SLIP_EXPANSION(size) ((size * 2 + 2 + 0xF) & ~0xFLU)
-#define SER_WRITE_QUEUE_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
+extern time_ms_t now_ms;
 
 extern struct eth_packet packet_pool[PACKET_POOL_SIZE];
 extern struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
@@ -144,7 +176,20 @@ extern size_t packet_pool_unallocated_count;
 // the MAC address we're applying to packets bridged from the SLIP interface
 extern struct ether_addr client_mac;
 extern struct ether_addr host_mac;
-extern struct ether_addr broadcast_mac;
+extern struct ether_addr const broadcast_mac;
+
+static inline time_ms_t time_ms_from_timespec(struct timespec ts) {
+  return (time_ms_t)((ts.tv_sec * 1000000000LL + ts.tv_nsec) / 1000000LL);
+}
+static inline time_ms_t time_since_ms(time_ms_t t_ms, time_ms_t base_ms) {
+  return t_ms - base_ms;
+}
+static inline int32_t diff_ms(time_ms_t x_ms, time_ms_t y_ms) {
+  return (int32_t)x_ms - (int32_t)y_ms;
+}
+static inline bool is_time_since_reasonable(time_ms_t t_ms) {
+  return t_ms < UINT32_MAX / 4;
+}
 
 void parse_args(int argc, char *argv[]);
 
@@ -156,17 +201,30 @@ void poll_loop(void);
 void client_process_frame(struct eth_packet *frame);
 bool client_forward_frame(struct eth_packet *frame);
 
+// Process a received frame (used by poll_loop)
 void net_process_frame(struct eth_packet *frame);
-bool net_forward_frame(struct eth_packet *frame);
-bool net_send_arp_frame(struct eth_packet *frame);
 
-bool arp_process_request(struct eth_packet *frame);
-bool arp_process_announce(struct eth_packet *frame);
+// Send a forwarded frame to the client via ser (internal)
+bool net_forward_frame(struct eth_packet *frame);
+
+// Send a link-level frame via eth or pkt (used by client, arp)
+void net_send_link_frame(struct eth_packet *frame);
+
+bool net_has_work(void);
+bool net_waiting(void);
+
+bool arp_process_frame(struct eth_packet *frame);
 void arp_snoop_ip_frame(struct eth_packet const *frame);
-bool arp_fetch_address(struct in_addr const *ip_addr,
-                       struct ether_addr *found_eth_addr);
-bool arp_announce(struct in_addr const *ip_addr,
-                  struct ether_addr *found_eth_addr);
+bool arp_fetch_address(struct in_addr const requesting_ip,
+                       struct in_addr const ip_addr, bool permissive,
+                       struct ether_addr *out_mac_addr);
+
+// Format and emit a frame with an announcement of our IP address
+void arp_send_announce(struct in_addr ip_addr, struct ether_addr mac_addr);
+
+bool arp_has_work(void);
+void arp_process_queued(void);
+void arp_idle(void);
 
 // bool dhcp_snoop_request(struct eth_packet *frame);
 // bool dhcp_snoop_response(struct eth_packet *frame);
@@ -176,6 +234,7 @@ void ser_setup_pollfd(struct pollfd *pfd);
 void ser_read_available(void);
 void ser_accumulate_bytes(uint8_t *data, size_t size);
 void ser_send(struct eth_packet *frame);
+bool ser_has_work(void);
 void ser_try_write_all_queued(void);
 
 #if USE_IF_ETH
@@ -183,10 +242,8 @@ void eth_init(char const *eth_dev_name);
 void eth_setup_pollfd(struct pollfd *pfd);
 void eth_read_available(void);
 void eth_send(struct eth_packet *frame);
+bool eth_has_work(void);
 void eth_try_write_all_queued(void);
-
-void eth_get_hwaddr(int eth_socket, char const *dev_name,
-                    struct ether_addr *hwaddr);
 #endif
 
 #if USE_IF_PKT
@@ -194,6 +251,7 @@ void pkt_init(void);
 void pkt_setup_pollfd(struct pollfd *pfd);
 void pkt_read_available(void);
 void pkt_send(struct eth_packet *frame);
+bool pkt_has_work(void);
 void pkt_try_write_all_queued(void);
 #endif
 
@@ -202,10 +260,45 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
 bool validate_eth_ip_frame(struct eth_packet const *frame);
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size);
 
+static inline bool is_proper_ip_address(struct in_addr ip_addr) {
+  // Reserved addresses! But especially ones that should not be picked up as if
+  // they were real host addresses. Note this doesn't include the net-local
+  // broadcast or "zero" address, because you need to know the network/netmask
+  // to determine those.
+  // clang-format off
+  // 0.0.0.0/8: this host
+  // 127.0.0.0/8 : loopback
+  // 169.254.0.0/16: link-local
+  // 255.255.255.255/32: broadcast
+  // clang-format on
+  uint32_t addr = ntohl(ip_addr.s_addr);
+  return ((addr & 0xFF000000UL) != 0x00000000UL) &&
+         ((addr & 0xFF000000UL) != 0x7F000000UL) &&
+         ((addr & 0xFFC00000UL) != 0x64400000UL) &&
+         ((addr & 0xFFFF0000UL) != 0xA9FE0000UL) && (addr != 0xFFFFFFFFUL);
+}
+
+static inline bool is_local_ip_address(struct in_addr ip_addr,
+                                       struct in_addr net_addr,
+                                       struct in_addr net_mask) {
+  assert((net_addr.s_addr & ~net_mask.s_addr) == 0);
+  return (ip_addr.s_addr & net_mask.s_addr) == net_addr.s_addr;
+}
+
+// "this net" is for devices in the process of figuring out what network they're
+// on (e.g. DHCP)
+static inline bool is_this_net_ip_address(struct in_addr ip_addr) {
+  return (ntohl(ip_addr.s_addr) & 0xFF000000UL) == 0x00000000UL;
+}
+
+// "this net" is for devices in the process of figuring out what their own IP
+// address is (e.g. DHCP)
+static inline bool is_this_host_ip_address(struct in_addr ip_addr) {
+  return ntohl(ip_addr.s_addr) == 0x00000000UL;
+}
+
 struct eth_packet *alloc_packet_buf(void);
 void free_packet_buf(struct eth_packet *packet);
-
-int sock_get_ifindex(int eth_socket, char const *dev_name);
 
 void hex_dump(FILE *f, void const *buf, size_t size);
 

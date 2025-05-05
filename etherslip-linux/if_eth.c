@@ -2,15 +2,12 @@
 
 #if USE_IF_ETH
 
+int eth_ifindex = -1;
+char eth_ifname[IF_NAMESIZE];
 int eth_socket = -1;
 struct eth_packet *eth_write_queue = NULL;
 
-void eth_init(char const *eth_dev_name) {
-  // TODO enumerate ethernet devices
-  // if (strlen(tx_dev_name) == 0) {
-  //   snprintf(tx_dev_name, sizeof tx_dev_name, "enp0s25");
-  // }
-
+void eth_init(char const *if_name) {
   // Create a raw socket
   eth_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
   if (eth_socket < 0) {
@@ -18,14 +15,71 @@ void eth_init(char const *eth_dev_name) {
     exit(1);
   }
 
-  if (strlen(eth_dev_name) > 0) {
-    eth_get_hwaddr(eth_socket, eth_dev_name, &host_mac);
+  struct ifreq ioc_req;
+  if (*if_name == '\0') {
+    if (verbose_log) {
+      logf("eth: no interface specified, scanning\n");
+    }
+
+    for (int i = 1; i < 100; ++i) {
+      memset(&ioc_req, 0, sizeof ioc_req);
+      ioc_req.ifr_ifindex = i;
+      if (ioctl(eth_socket, SIOCGIFNAME, &ioc_req) < 0) {
+        goto autoconf_fail;
+      }
+      if (verbose_log) {
+        logf("eth: found interface at index %d: %s\n", i, ioc_req.ifr_name);
+      }
+      if (ioctl(eth_socket, SIOCGIFFLAGS, &ioc_req) < 0) {
+        if (very_verbose_log) {
+          logf("eth: couldn't get flags for interface %s\n", ioc_req.ifr_name);
+          continue;
+        }
+      }
+      if (very_verbose_log) {
+        logf("eth: interface %s flags =%s%s%s\n", ioc_req.ifr_name,
+             ioc_req.ifr_flags & IFF_UP ? " UP" : " DOWN",
+             ioc_req.ifr_flags & IFF_LOOPBACK ? " LOOPBACK" : "",
+             ioc_req.ifr_flags & IFF_RUNNING ? " RUNNING" : "");
+      }
+      if ((eth_ifindex < 0) && (ioc_req.ifr_flags & IFF_UP) &&
+          !(ioc_req.ifr_flags & IFF_LOOPBACK) &&
+          (ioc_req.ifr_flags & IFF_RUNNING)) {
+        eth_ifindex = i;
+        snprintf(eth_ifname, IF_NAMESIZE, "%s", ioc_req.ifr_name);
+        goto autoconf_success;
+      }
+    }
+
+  autoconf_fail:
+    logf("eth: no suitable interface found\n");
+    exit(1);
+  autoconf_success:
   } else {
-    memcpy(&host_mac, &broadcast_mac, sizeof host_mac);
+    snprintf(eth_ifname, IF_NAMESIZE, "%s", if_name);
   }
+
+  logf("eth: using interface %s\n", eth_ifname);
+
+  memset(&ioc_req, 0, sizeof ioc_req);
+  snprintf(ioc_req.ifr_name, IF_NAMESIZE, "%s", eth_ifname);
+  if (ioctl(eth_socket, SIOCGIFHWADDR, &ioc_req) < 0) {
+    perror("get socket hardware address failed");
+    exit(1);
+  }
+  memcpy(&host_mac, ioc_req.ifr_hwaddr.sa_data, ETH_ALEN);
+  logf("eth: host MAC address %s\n", ether_ntoa(&host_mac));
+
+  // memset(&if_ioreq, 0, sizeof if_ioreq);
+  // snprintf(if_ioreq.ifr_name, IFNAMSIZ, "%s", dev_name);
+  // if (ioctl(eth_socket, SIOCGIFHWADDR, &if_ioreq) < 0) {
+  //   perror("get socket hardware address failed");
+  //   exit(1);
+  // }
+  // memcpy(hwaddr, if_ioreq.ifr_hwaddr.sa_data, ETH_ALEN);
 }
 
-void eth_setup_pollfd(struct pollfd* pfd) {
+void eth_setup_pollfd(struct pollfd *pfd) {
   pfd->fd = eth_socket;
   pfd->events = POLLIN;
   if (eth_write_queue != NULL) {
@@ -77,10 +131,6 @@ void eth_send(struct eth_packet *frame) {
     return;
   }
 
-  // Rewrite ethernet source and dest addresses
-  memcpy(&frame->hdr.h_source, &client_mac, sizeof(struct ether_addr));
-  memcpy(&frame->hdr.h_dest, &broadcast_mac, sizeof(struct ether_addr));
-
   if (very_verbose_log && send_log) {
     logf("eth_send packet:\n");
     hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
@@ -96,6 +146,8 @@ void eth_send(struct eth_packet *frame) {
   eth_try_write_all_queued();
 }
 
+bool eth_has_work(void) { return eth_write_queue != NULL; }
+
 void eth_try_write_all_queued(void) {
   if (eth_write_queue == NULL) {
     return;
@@ -104,9 +156,10 @@ void eth_try_write_all_queued(void) {
   ssize_t res;
   struct sockaddr_ll dest_sa;
   memset(&dest_sa, 0, sizeof dest_sa);
-  dest_sa.sll_family = AF_PACKET;
+  dest_sa.sll_ifindex = AF_PACKET;
   dest_sa.sll_halen = ETH_ALEN;
-  memcpy(&dest_sa, eth_write_queue->hdr.h_dest, ETH_ALEN);
+  dest_sa.sll_hatype = PACKET_OUTGOING;
+  memcpy(&dest_sa.sll_addr, eth_write_queue->hdr.h_dest, ETH_ALEN);
   if (very_verbose_log && send_log) {
     char srcaddr[20], destaddr[20];
     inet_ntop(AF_INET, &eth_write_queue->ip.hdr.saddr, srcaddr, sizeof srcaddr);
@@ -130,19 +183,6 @@ void eth_try_write_all_queued(void) {
   }
   free_packet_buf(eth_write_queue);
   eth_write_queue = NULL;
-}
-
-void eth_get_hwaddr(int eth_socket, char const *dev_name,
-                    struct ether_addr *hwaddr) {
-  struct ifreq if_ioreq;
-
-  memset(&if_ioreq, 0, sizeof if_ioreq);
-  snprintf(if_ioreq.ifr_name, IFNAMSIZ, "%s", dev_name);
-  if (ioctl(eth_socket, SIOCGIFHWADDR, &if_ioreq) < 0) {
-    perror("get socket hardware address failed");
-    exit(1);
-  }
-  memcpy(hwaddr, if_ioreq.ifr_hwaddr.sa_data, ETH_ALEN);
 }
 
 #endif

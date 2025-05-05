@@ -6,16 +6,17 @@ bool verbose_log = false;
 bool very_verbose_log = false;
 
 bool client_ready = false;
-
 uint32_t ser_bps = 115200;
+
+time_ms_t now_ms = 0;
 
 struct eth_packet packet_pool[PACKET_POOL_SIZE];
 struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 size_t packet_pool_unallocated_count = 0;
 
-struct ether_addr client_mac = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
+struct ether_addr client_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr host_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
-struct ether_addr broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+struct ether_addr const broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
@@ -34,7 +35,7 @@ int main(int argc, char *argv[]) {
 void parse_args(int argc, char *argv[]) {
   char ser_dev_name[PATH_MAX] = "";
 #if USE_IF_ETH
-  char eth_dev_name[IFNAMSIZ] = "";
+  char net_if_name[IF_NAMESIZE] = "";
   struct ether_addr const *tmp_mac;
 #endif
 
@@ -69,33 +70,11 @@ void parse_args(int argc, char *argv[]) {
         client_ready = true;
       } break;
       case 'e': {
-        snprintf(eth_dev_name, IFNAMSIZ, "%s", optarg);
+        snprintf(net_if_name, IF_NAMESIZE, "%s", optarg);
       } break;
 #elif USE_IF_PKT
 #else
 #error "Must specify an interface type"
-#endif
-
-#if 0
-      case 'T': {
-        struct ip_packet pkt;
-        pkt.hdr.version = 4;
-        pkt.hdr.ihl = 5;
-        pkt.hdr.tos = 0x00;
-        pkt.hdr.tot_len = htons(offsetof(struct ip_packet, ip_payload[256]));
-        pkt.hdr.frag_off = htons(0);
-        pkt.hdr.ttl = 0x40;
-        pkt.hdr.id = 0x01;
-        pkt.hdr.check = 0;
-        pkt.hdr.daddr = inet_addr("192.168.86.255");
-        pkt.hdr.saddr = inet_addr("192.168.86.43");
-        for (size_t i = 0; i < 256; ++i) {
-          pkt.ip_payload[i] = (uint8_t)i;
-        }
-        pkt.hdr.check = ip_header_checksum(&pkt, pkt.hdr.ihl * 4);
-        ser_send(&pkt);
-        exit(0);
-      } break;
 #endif
 
       case 'R': {
@@ -106,8 +85,10 @@ void parse_args(int argc, char *argv[]) {
       } break;
       case 'v': {
         if (verbose_log) {
+          // logf("very verbose logging\n");
           very_verbose_log = true;
         } else {
+          // logf("verbose logging\n");
           verbose_log = true;
         }
       } break;
@@ -122,7 +103,7 @@ void parse_args(int argc, char *argv[]) {
 
   ser_init(ser_dev_name);
 #if USE_IF_ETH
-  eth_init(eth_dev_name);
+  eth_init(net_if_name);
 #elif USE_IF_PKT
   pkt_init();
 #else
@@ -164,43 +145,49 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
 void poll_loop(void) {
   struct pollfd poll_fds[FDS_SIZE];
 
-  struct timespec last_keepalive_time;
-  clock_gettime(CLOCK_MONOTONIC, &last_keepalive_time);
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  time_ms_t last_ms = time_ms_from_timespec(ts);
+  time_ms_t keepalive_ms = 0;
 
-  for (;;) {
+  ser_setup_pollfd(&poll_fds[SER_IDX]);
 #if USE_IF_ETH
-    eth_setup_pollfd(&poll_fds[ETH_IDX]);
+  eth_setup_pollfd(&poll_fds[ETH_IDX]);
 #elif USE_IF_PKT
+  pkt_setup_pollfd(&poll_fds[PKT_IDX]);
 #else
 #error "Must specify an interface type"
 #endif
 
-    int poll_res = poll(poll_fds, FDS_SIZE, 100);
-
+  for (;;) {
+    int poll_timeout = 100;
+    if (ser_has_work() || net_has_work()
+#if USE_IF_ETH
+        || eth_has_work()
+#elif USE_IF_PKT
+        || pkt_has_work()
+#else
+#error "Must specify an interface type"
+#endif
+        || arp_has_work()) {
+      poll_timeout = 0;
+    } else if (net_waiting()) {
+      poll_timeout = 1;
+    }
+    int poll_res = poll(poll_fds, FDS_SIZE, poll_timeout);
     if (poll_res < 0) {
       perror("poll failed");
       exit(1);
     }
 
-#if 1
-    struct timespec cur_time;
-    clock_gettime(CLOCK_MONOTONIC, &cur_time);
-    int64_t dmsec =
-        ((cur_time.tv_sec - last_keepalive_time.tv_sec) * 1000000000LL +
-         (cur_time.tv_nsec - last_keepalive_time.tv_nsec)) /
-        1000000LL;
-    bool keepalive = false;
+    // Update the now_ms clock (right after a potentially long poll() wait is
+    // the proper time)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    time_ms_t read_ms = time_ms_from_timespec(ts);
+    now_ms += time_since_ms(read_ms, last_ms);
+    last_ms = read_ms;
 
-    if (dmsec > 2000) {
-      last_keepalive_time.tv_sec += 2;
-      keepalive = true;
-    }
-#endif
-
-    if (keepalive && verbose_log) {
-      logf("%lu: alive (%d)\n",
-           cur_time.tv_sec * 1000LU + cur_time.tv_nsec / 1000000LU, poll_res);
-    }
+    // Check if any data was returned in the poll() call
     if (poll_res > 0) {
       // Data available somewhere!
 
@@ -247,8 +234,10 @@ void poll_loop(void) {
 #error "Must specify an interface type"
 #endif
 
-      ser_try_write_all_queued();
+      arp_process_queued();
 
+      // Do any queued writes resulting from the reads
+      ser_try_write_all_queued();
 #if USE_IF_ETH
       eth_try_write_all_queued();
 #elif USE_IF_PKT
@@ -256,6 +245,14 @@ void poll_loop(void) {
 #else
 #error "Must specify an interface type"
 #endif
+
+      // Do ARP table cleanup
+      arp_idle();
+
+      if ((keepalive_ms - now_ms > 2000) && verbose_log) {
+        keepalive_ms += 2000;
+        logf("%lu: alive (%d)\n", (unsigned long)now_ms, poll_res);
+      }
     }
   }
 }
@@ -297,13 +294,7 @@ bool client_forward_frame(struct eth_packet *frame) {
   }
 
   frame->hdr.h_proto = ETH_P_IP;
-#if USE_IF_ETH
-  eth_send(frame);
-#elif USE_IF_PKT
-  pkt_send(frame);
-#else
-#error "Must specify an interface type"
-#endif
+  net_send_link_frame(frame);
 
   return true;
 }
@@ -338,7 +329,7 @@ void net_process_frame(struct eth_packet *frame) {
 #endif
   else if (frame->hdr.h_proto == 0x0806) {
     // Some kind of ARP frame, take a look see
-    if (arp_process_announce(frame)) {
+    if (arp_process_frame(frame)) {
       frame = NULL;
     }
   } else if (validate_eth_ip_frame(frame)) {
@@ -359,21 +350,6 @@ void net_process_frame(struct eth_packet *frame) {
   if (frame != NULL) {
     free_packet_buf(frame);
   }
-}
-
-bool net_process_arp_request(struct eth_packet *frame) {
-  // TODO respond to ARP requests directly
-  (void)frame;
-  return false;
-}
-
-bool net_process_dhcp_response(struct eth_packet *frame) {
-  // Caller promises this is actually a valid IP packet
-  assert(validate_eth_ip_frame(frame));
-
-  // TODO pick up assigned IP address, then forward
-  (void)frame;
-  return false;
 }
 
 bool net_forward_frame(struct eth_packet *frame) {
@@ -400,6 +376,20 @@ bool net_forward_frame(struct eth_packet *frame) {
   ser_send(frame);
   return true;
 }
+
+void net_send_link_frame(struct eth_packet *frame) {
+#if USE_IF_ETH
+  eth_send(frame);
+#elif USE_IF_PKT
+  pkt_send(frame);
+#else
+#error "Must specify an interface type"
+#endif
+}
+
+bool net_has_work(void) { return false; }
+
+bool net_waiting(void) { return false; }
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size) {
@@ -496,18 +486,6 @@ void free_packet_buf(struct eth_packet *packet) {
   //   logf("free buf, %lu available\n",
   //        (unsigned long)packet_pool_unallocated_count);
   // }
-}
-
-int sock_get_ifindex(int fd, char const *dev_name) {
-  struct ifreq if_ioreq;
-
-  memset(&if_ioreq, 0, sizeof if_ioreq);
-  snprintf(if_ioreq.ifr_name, IFNAMSIZ, "%s", dev_name);
-  if (ioctl(fd, SIOCGIFINDEX, &if_ioreq) < 0) {
-    perror("get socket index failed");
-    exit(1);
-  }
-  return if_ioreq.ifr_ifindex;
 }
 
 void hex_dump(FILE *f, void const *buf, size_t size) {

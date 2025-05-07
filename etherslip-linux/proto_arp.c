@@ -552,7 +552,7 @@ void arp_idle(void) {
   for (uint32_t j = 0; j < check_count; ++j) {
 #if !defined(NDEBUG)
     if (very_verbose_log && (arp_idle_check_counter == 0)) {
-      logf("arp: ARP cache debug dump\n");
+      logf("\narp: ARP cache debug dump\n");
       logf("arp: || %15s || %16s || %9s || %2s || %6s || %10s || %10s ||\n",
            "IP address", "MAC address", "state", "bk", "import", "seen age",
            "state age");

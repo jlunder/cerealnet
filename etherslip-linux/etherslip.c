@@ -65,11 +65,26 @@ void parse_args(int argc, char *argv[]) {
         break;
       }
       case 'm': {
-        if ((tmp_mac = ether_aton(optarg)) == NULL) {
-          print_usage_and_exit(argv[0],
-                               "Bad argument to -m: expected MAC address", 1);
+        if (strcasecmp(optarg, "gen") == 0) {
+          struct timespec ts;
+          if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+            ts.tv_sec = time(NULL);
+            ts.tv_nsec = 0;
+          }
+          srand(ts.tv_sec + ts.tv_nsec);
+          for (int i = 0; i < ETH_ALEN; ++i) {
+            client_mac.ether_addr_octet[i] = (rand() >> 2) & 0xFF;
+          }
+          client_mac.ether_addr_octet[0] |= 0x02;
+          logf("eth: generated client MAC %s\n", ether_ntoa(&client_mac));
+        } else {
+          tmp_mac = ether_aton(optarg);
+          if (tmp_mac == NULL) {
+            print_usage_and_exit(argv[0],
+                                 "Bad argument to -m: expected MAC address", 1);
+          }
+          memcpy(&client_mac, tmp_mac, sizeof(struct ether_addr));
         }
-        memcpy(&client_mac, tmp_mac, sizeof(struct ether_addr));
         client_ready = true;
       } break;
       case 'e': {
@@ -123,11 +138,12 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
 #if USE_IF_ETH
       "Usage: %s [-bempsD...]"
       "\n"
-      "    -p          Proxy mode: use the host machine's MAC address\n"
+      "    -p          Proxy mode: use the host's MAC address and ARP\n"
       "    -s <DEV>    Offer SLIP bridge to a client on DEV\n"
       "    -b <BPS>    Set serial port speed to BPS (default: 115200)"
       "    -e <DEV>    Bridge ethernet device DEV\n"
       "    -m <MAC>    Use MAC, instead of autodetecting/proxying\n"
+      "    -m gen      Generate a random MAC\n"
       //"    -a <IP>     Enable rudimentary masquerading (ARP and rewriting)\n"
       "    -D          Disable snooping of DHCP\n"
       "\n"

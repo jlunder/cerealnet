@@ -182,17 +182,16 @@ int main(int argc, char *argv[]) {
   // memcpy(&dest_sa.sll_addr, frame.hdr.h_dest, ETH_ALEN);
 #if 0
   {
-    char srcaddr[20], destaddr[20];
-    inet_ntop(AF_INET, &eth_write_queue->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-    inet_ntop(AF_INET, &eth_write_queue->ip.hdr.daddr, destaddr,
-              sizeof destaddr);
     logf(
         "eth write queued frame, %lu bytes, dest mac=%s; "
-        "hdr tot_len=%lu, proto=%02X, sa=%s, da=%s\n",
+        "hdr tot_len=%lu, proto=%02X, sa=%s, ",
         (unsigned long)eth_write_queue->recv_size,
         ether_ntoa((struct ether_addr const *)&eth_write_queue->hdr.h_dest),
         (unsigned long)ntohs(eth_write_queue->ip.hdr.tot_len),
-        (int)eth_write_queue->ip.hdr.protocol, srcaddr, destaddr);
+        (int)eth_write_queue->ip.hdr.protocol,
+        inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.saddr));
+    logf("da=%s\n",
+         inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.daddr));
   }
 #endif
   res = sendto(eth_socket, &frame, frame.recv_size, MSG_DONTWAIT,

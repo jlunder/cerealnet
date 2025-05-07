@@ -70,6 +70,12 @@ void eth_init(char const *if_name) {
   memcpy(&host_mac, ioc_req.ifr_hwaddr.sa_data, ETH_ALEN);
   logf("eth: host MAC address %s\n", ether_ntoa(&host_mac));
 
+  struct sockaddr_ll ifaddr;
+  memset(&ifaddr, 0, sizeof ifaddr);
+  ifaddr.sll_family = AF_PACKET;
+  ifaddr.sll_ifindex = eth_ifindex;
+  bind(eth_socket, (struct sockaddr *)&ifaddr, sizeof ifaddr);
+
   // memset(&if_ioreq, 0, sizeof if_ioreq);
   // snprintf(if_ioreq.ifr_name, IFNAMSIZ, "%s", dev_name);
   // if (ioctl(eth_socket, SIOCGIFHWADDR, &if_ioreq) < 0) {
@@ -97,13 +103,11 @@ void eth_read_available(void) {
     return;
   }
 
-  struct sockaddr_storage packet_addr;
-  socklen_t packet_addr_len = sizeof packet_addr;
   ssize_t recv_size;
 
   assert(sizeof frame->eth_raw == MAX_PACKET_SIZE);
-  recv_size = recvfrom(eth_socket, frame, MAX_PACKET_SIZE, MSG_DONTWAIT,
-                       (struct sockaddr *)&packet_addr, &packet_addr_len);
+  recv_size =
+      recvfrom(eth_socket, frame, MAX_PACKET_SIZE, MSG_DONTWAIT, NULL, NULL);
   if (recv_size < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
       // No message waiting after all
@@ -121,7 +125,7 @@ void eth_read_available(void) {
 void eth_send(struct eth_packet *frame) {
   assert(frame != NULL);
   struct ip_packet *ip_frame = &frame->ip;
-  assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(frame)));
+  assert(validate_eth_ip_frame(frame));
 
   if (!client_ready) {
     // We need a MAC address to send, but if we're not ready it's uninitialized
@@ -161,17 +165,16 @@ void eth_try_write_all_queued(void) {
   dest_sa.sll_hatype = PACKET_OUTGOING;
   memcpy(&dest_sa.sll_addr, eth_write_queue->hdr.h_dest, ETH_ALEN);
   if (very_verbose_log && send_log) {
-    char srcaddr[20], destaddr[20];
-    inet_ntop(AF_INET, &eth_write_queue->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-    inet_ntop(AF_INET, &eth_write_queue->ip.hdr.daddr, destaddr,
-              sizeof destaddr);
     logf(
         "eth write queued frame, %lu bytes, dest mac=%s; "
-        "hdr tot_len=%lu, proto=%02X, sa=%s, da=%s\n",
+        "hdr tot_len=%lu, proto=%02X, sa=%s, ",
         (unsigned long)eth_write_queue->recv_size,
         ether_ntoa((struct ether_addr const *)&eth_write_queue->hdr.h_dest),
         (unsigned long)ntohs(eth_write_queue->ip.hdr.tot_len),
-        (int)eth_write_queue->ip.hdr.protocol, srcaddr, destaddr);
+        (int)eth_write_queue->ip.hdr.protocol,
+        inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.saddr));
+    logf("da=%s\n",
+         inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.daddr));
   }
   res = sendto(eth_socket, eth_write_queue, eth_write_queue->recv_size,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);

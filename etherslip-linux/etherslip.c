@@ -17,6 +17,9 @@ size_t packet_pool_unallocated_count = 0;
 struct ether_addr client_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr host_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr const broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
+struct ether_addr const zero_mac = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
+
+struct in_addr client_ip = {0};
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
@@ -264,16 +267,19 @@ void client_process_frame(struct eth_packet *frame) {
       logf("client packet runt frame (%lu bytes)\n",
            (unsigned long)frame->recv_size);
     }
-  } else if (!validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame))) {
-    // Ignore packet, not valid IP
-    if (verbose_log && send_log) {
-      logf("client packet not valid (%lu bytes):\n",
-           (unsigned long)ETH_IP_SIZE(frame));
-      hex_dump(stdlog, frame->ip.ip_raw, ETH_IP_SIZE(frame));
+  } else
+    // validate_ip_frame not validate_eth_ip_frame, because the ethernet frame
+    // is forged for client (SLIP) packets anyway
+    if (!validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame))) {
+      // Ignore packet, not valid IP
+      if (verbose_log && send_log) {
+        logf("client packet not valid (%lu bytes):\n",
+             (unsigned long)ETH_IP_SIZE(frame));
+        hex_dump(stdlog, frame->ip.ip_raw, ETH_IP_SIZE(frame));
+      }
+    } else if (client_forward_frame(frame)) {
+      frame = NULL;
     }
-  } else if (client_forward_frame(frame)) {
-    frame = NULL;
-  }
 
   if (frame != NULL) {
     free_packet_buf(frame);
@@ -282,18 +288,17 @@ void client_process_frame(struct eth_packet *frame) {
 
 bool client_forward_frame(struct eth_packet *frame) {
   if (very_verbose_log && send_log) {
-    char srcaddr[20], destaddr[20];
-    inet_ntop(AF_INET, &frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-    inet_ntop(AF_INET, &frame->ip.hdr.daddr, destaddr, sizeof destaddr);
     logf(
         "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
-        "sa=%s, da=%s\n",
+        "sa=%s, ",
         (unsigned long)ETH_IP_SIZE(frame),
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
-        (int)frame->ip.hdr.protocol, srcaddr, destaddr);
+        (int)frame->ip.hdr.protocol,
+        inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
+    logf("da=%s\n", inet_ntoa(*(struct in_addr *)&frame->ip.hdr.daddr));
   }
 
-  frame->hdr.h_proto = ETH_P_IP;
+  frame->hdr.h_proto = htons(ETH_P_IP);
   net_send_link_frame(frame);
 
   return true;
@@ -310,40 +315,38 @@ void net_process_frame(struct eth_packet *frame) {
     // Ignore packet, too big (extra jumbo frame? We can't handle it)
     logf("net packet too big (trucated to %lu of %lu bytes)\n",
          (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->recv_size);
-  }
-#if USE_IF_ETH
-  else if ((!client_ready ||
-            memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
-           (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
-    // If it's a valid IP frame, use it to infer IP <-> MAC mappings
-    if (validate_eth_ip_frame(frame)) {
-      arp_snoop_ip_frame(frame);
-    }
-    // Beyond that, ignore the packet, it's not for us
-    // TODO multicast support? Not sure how this works
-    if (very_verbose_log && recv_log) {
-      logf("net packet for another host (%s)\n",
-           ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest));
-    }
-  }
-#endif
-  else if (frame->hdr.h_proto == 0x0806) {
-    // Some kind of ARP frame, take a look see
-    if (arp_process_frame(frame)) {
-      frame = NULL;
-    }
+  } else if (arp_process_frame(frame)) {
+    frame = NULL;
   } else if (validate_eth_ip_frame(frame)) {
-    // Valid IP frame, intended for us
+    // Valid IP frame...
     arp_snoop_ip_frame(frame);
-    if (client_ready && net_forward_frame(frame)) {
-      frame = NULL;
+#if USE_IF_ETH
+    if ((!client_ready ||
+         memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
+        (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
+      // TODO multicast support? Not sure how this works
+      if (very_verbose_log && recv_log) {
+        logf("net packet for another host (%s)\n",
+             ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest));
+      }
+    } else {
+#endif
+      if (client_ready && net_forward_frame(frame)) {
+        frame = NULL;
+      }
+#if USE_IF_ETH
     }
+#endif
   } else {
     // Ignore packet: it's not valid IP
     if (very_verbose_log && recv_log) {
-      logf("net packet addressed to us but not recognized (%lu bytes):\n",
-           (unsigned long)frame->recv_size);
-      hex_dump(stdlog, &frame->eth_raw, frame->recv_size);
+      if ((client_ready &&
+           memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) == 0) ||
+          (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0)) {
+        logf("net packet not recognized (%lu bytes):\n",
+             (unsigned long)frame->recv_size);
+        hex_dump(stdlog, &frame->eth_raw, frame->recv_size);
+      }
     }
   }
 
@@ -358,15 +361,14 @@ bool net_forward_frame(struct eth_packet *frame) {
 
   // A complete packet and we're ready for it!
   if (very_verbose_log && recv_log) {
-    char srcaddr[20], destaddr[20];
-    inet_ntop(AF_INET, &frame->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-    inet_ntop(AF_INET, &frame->ip.hdr.daddr, destaddr, sizeof destaddr);
     logf(
         "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
-        "sa=%s, da=%s\n",
+        "sa=%s, ",
         (unsigned long)frame->recv_size,
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
-        (int)frame->ip.hdr.protocol, srcaddr, destaddr);
+        (int)frame->ip.hdr.protocol,
+        inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
+    logf("da=%s\n", inet_ntoa(*(struct in_addr *)&frame->ip.hdr.daddr));
   }
 
   // TODO rewrite IP addresses for masquerading if needed
@@ -431,7 +433,10 @@ bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {
   // tests passing to be safe, e.g. checking the header checksum after
   // verifying that the received packet isn't truncated
   if (ip_frame->hdr.version != 4) {
-    logf("invalid IP packet: bad version (%d)\n", (int)ip_frame->hdr.version);
+    // IPv6 is common enough we don't want to spam about it unbidden
+    if ((ip_frame->hdr.version != 6) || very_verbose_log) {
+      logf("invalid IP packet: bad version (%d)\n", (int)ip_frame->hdr.version);
+    }
     return false;
   }
   size_t header_size = ip_frame->hdr.ihl * 4;

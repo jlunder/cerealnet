@@ -114,17 +114,16 @@ void pkt_try_write_all_queued(void) {
          sizeof dest_sa.sin_addr);
   dest_sa.sin_port = 0;
   if (very_verbose_log && send_log) {
-    char srcaddr[20], destaddr[20];
-    inet_ntop(AF_INET, &pkt_write_queue->ip.hdr.saddr, srcaddr, sizeof srcaddr);
-    inet_ntop(AF_INET, &pkt_write_queue->ip.hdr.daddr, destaddr,
-              sizeof destaddr);
     logf(
         "pkt write queued frame, %lu bytes, dest mac=%s; "
-        "hdr tot_len=%lu, proto=%02X, sa=%s, da=%s\n",
+        "hdr tot_len=%lu, proto=%02X, sa=%s, ",
         (unsigned long)pkt_write_queue->recv_size,
         ether_ntoa((struct ether_addr const *)&pkt_write_queue->hdr.h_dest),
         (unsigned long)ntohs(pkt_write_queue->ip.hdr.tot_len),
-        (int)pkt_write_queue->ip.hdr.protocol, srcaddr, destaddr);
+        (int)pkt_write_queue->ip.hdr.protocol,
+        inet_ntoa(*(struct in_addr *)&pkt_write_queue->ip.hdr.saddr));
+    logf("da=%s\n",
+         inet_ntoa(*(struct in_addr *)&pkt_write_queue->ip.hdr.daddr));
   }
   res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->recv_size,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);

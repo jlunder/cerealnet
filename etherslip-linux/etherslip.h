@@ -143,15 +143,17 @@ struct eth_packet {
   union {
     struct {
       struct ethhdr hdr;
-      struct ip_packet ip;
+      union {
+        struct ether_arp arp;
+        struct ip_packet ip;
+      };
     } __attribute__((packed));
-    struct arp_msg arp;
     uint8_t eth_raw[MAX_PACKET_SIZE];
   };
   size_t recv_size;
 } __attribute__((packed));
 
-static_assert(sizeof (struct ethhdr) == ETH_HLEN);
+static_assert(sizeof(struct ethhdr) == ETH_HLEN);
 
 typedef uint32_t time_ms_t;
 
@@ -177,6 +179,9 @@ extern size_t packet_pool_unallocated_count;
 extern struct ether_addr client_mac;
 extern struct ether_addr host_mac;
 extern struct ether_addr const broadcast_mac;
+extern struct ether_addr const zero_mac;
+
+extern struct in_addr client_ip;
 
 static inline time_ms_t time_ms_from_timespec(struct timespec ts) {
   return (time_ms_t)((ts.tv_sec * 1000000000LL + ts.tv_nsec) / 1000000LL);
@@ -184,11 +189,18 @@ static inline time_ms_t time_ms_from_timespec(struct timespec ts) {
 static inline time_ms_t time_since_ms(time_ms_t t_ms, time_ms_t base_ms) {
   return t_ms - base_ms;
 }
+static inline bool is_time_past_ms(time_ms_t t_ms, time_ms_t ref_ms) {
+  return time_since_ms(t_ms, ref_ms) <= UINT32_MAX / 2;
+}
 static inline int32_t diff_ms(time_ms_t x_ms, time_ms_t y_ms) {
   return (int32_t)x_ms - (int32_t)y_ms;
 }
-static inline bool is_time_since_reasonable(time_ms_t t_ms) {
-  return t_ms < UINT32_MAX / 4;
+static inline bool is_reasonable_time_ms(time_ms_t t_ms) {
+  return t_ms <= UINT32_MAX / 4;
+}
+static inline bool is_reasonable_time_since_ms(time_ms_t t_ms,
+                                               time_ms_t ref_ms) {
+  return is_reasonable_time_ms(time_since_ms(t_ms, ref_ms));
 }
 
 void parse_args(int argc, char *argv[]);
@@ -219,8 +231,11 @@ bool arp_fetch_address(struct in_addr const requesting_ip,
                        struct in_addr const ip_addr, bool permissive,
                        struct ether_addr *out_mac_addr);
 
+void arp_merge_entry(struct ether_addr merge_mac, struct in_addr merge_ip);
+
 // Format and emit a frame with an announcement of our IP address
-void arp_send_announce(struct in_addr ip_addr, struct ether_addr mac_addr);
+void arp_send_announce(struct ether_addr announce_mac,
+                       struct in_addr announce_ip);
 
 bool arp_has_work(void);
 void arp_process_queued(void);

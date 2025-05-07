@@ -1,11 +1,22 @@
 #include "etherslip.h"
 
+#if defined(NDEBUG)
 // 10 bits is 1024 entries, which should probably be plenty for like.. a few
 // hundred hosts, which is far more than any 486 wants to talk to on their local
 // subnet. 10 entries is probably a more realistic maximum! But memory is cheap.
 #define ARP_CACHE_SIZE_BITS 10
+#else
+#define ARP_CACHE_SIZE_BITS 4
+#endif
+
 #define ARP_CACHE_SIZE (1UL << ARP_CACHE_SIZE_BITS)
+
+#if defined(NDEBUG)
 #define ARP_CACHE_ASSOC 8
+#else
+#define ARP_CACHE_ASSOC 2
+#endif
+
 #define ARP_CACHE_PRIME 939193UL
 
 #define ARP_IMPORTANCE_MAX INT16_MAX
@@ -27,12 +38,12 @@
 // frequently to find out if the MAC address has changed for a host.
 
 // After an initial request, wait at least 1ms for an ARP response, then back
-// off exponentially (2ms, then 4ms, ...) up to 128ms when sending repeat
-// requests for the same host. The max interval of 128ms is also used for
-// refresh requests -- since we already have a nominally valid MAC address,
-// those are less urgent.
+// off exponentially (2ms, then 4ms, ...) up to (1 << 10) = 1024ms when sending
+// repeat requests for the same host. The max interval is also used for refresh
+// requests -- since we already have a nominally valid MAC address, those are
+// less urgent.
 #define ARP_REQUEST_RETRY_INITIAL_MS (1UL)
-#define ARP_REQUEST_RETRY_MAX_MS (128UL)
+#define ARP_REQUEST_RETRY_BACKOFF_MAX 10
 
 // The first time we request an address, wait an extra 50ms after we see the
 // first ARP response, to give a chance for multiple hosts to respond -- this is
@@ -53,8 +64,15 @@
 // than 1 hour, forget it entirely and invalidate the entry
 #define ARP_INVALIDATE_MS (60UL * 60UL * 1000UL)
 
+#if defined(NDEBUG)
 // Go through the whole table once every minute
 #define ARP_IDLE_SCAN_PERIOD_MS (60UL * 1000UL)
+#else
+#define ARP_IDLE_SCAN_PERIOD_MS (10UL * 1000UL)
+#endif
+
+// Don't announce our address too often -- at most once every 1s, in general
+#define ARP_ANNOUNCE_COOLDOWN_MS (1000UL)
 
 typedef uint16_t arp_importance_t;
 typedef uint8_t arp_state_t;
@@ -64,19 +82,50 @@ struct arp_cache_entry {
   struct ether_addr mac_addr;
   uint8_t pad_mac[2];
   arp_state_t state;
-  uint8_t pad[1];
+  uint8_t backoff;
   arp_importance_t importance;
   time_ms_t last_seen_ms;
-  time_ms_t last_request_ms;
-  time_ms_t last_backoff_ms;
-  struct in_addr last_requesting_ip;
+  time_ms_t last_state_ms;
+  uint8_t pad[8];
 } __attribute__((packed));
 
 static_assert(sizeof(struct arp_cache_entry) == 32);
 
+// This is *almost* a hopscotch hash -- each item gets hashed into a
+// neighborhood, which is a linear section of the otherwise flat cache. Adjacent
+// neighborhoods mostly overlap, they're not entirely distinct. The neighborhood
+// size is just the associativity, so if we have associativity 8, then the
+// neighborhoods overlap by 8-1 = 7 elements, just like with hopscotch hashing.
+// The only difference is I didn't bother implementing the actual hopscotch
+// algorithm; instead there's an LFU eviction policy with exponential decay.
+// Even that is probably massive overkill, if we're honest.
+
+// The only reason to implement neighborhoods is I don't like buckets, like, I
+// don't know that the neighborhoods have better or worse properties
+// mathematically and our cache is likely to be very very sparsely populated in
+// practice so it really doesn't matter. This just makes me happy.
+
+// If we do ever have problems with cache pressure, and you don't want to just
+// increase the cache size for whatever reason, implementing the hopscotch
+// algorithm would be a relatively simple change. It should be run from
+// arp_find_entry_to_evict first, and then idle scan could also proactively and
+// incrementally check for full neighborhoods, and shuffle elements around to
+// reduce pressure.
+
+// At that point you might also want to think about adaptively culling older
+// entries (or at least zero-importance ones) but oh man. It's already
+// overengineered and unless you're transplanting the code into some like
+// industrial grade router firmware or something I don't see why you would do
+// any of that. (And why you would want to use this code is beyond me when such
+// things probably need content-addressable memory or other crazy hardware
+// acceleration anyway...)
+
 struct arp_cache_entry arp_cache[ARP_CACHE_SIZE];
+
 uint32_t arp_idle_check_counter = 0;
-time_ms_t arp_idle_cycle_start_ms = 0;
+time_ms_t arp_idle_target_ms = 0;
+bool arp_announce_cooling_down = false;
+time_ms_t arp_last_announce_ms = 0;
 
 static_assert(((uint64_t)ARP_CACHE_SIZE * (uint64_t)ARP_IDLE_SCAN_PERIOD_MS) <
               UINT32_MAX);
@@ -87,8 +136,10 @@ static uint32_t arp_find_entry(uint32_t base, struct in_addr ip_addr);
 static uint32_t arp_find_entry_to_evict(uint32_t base);
 
 // Format and emit a frame with a request for some other IP address
-static void arp_send_request(struct in_addr requesting_ip,
-                             struct in_addr target_ip);
+void arp_send_request(struct ether_addr from_mac, struct in_addr from_ip,
+                      struct in_addr requesting_ip);
+void arp_send_response(struct ether_addr from_mac, struct in_addr from_ip,
+                       struct ether_addr to_mac, struct in_addr to_ip);
 
 static inline uint32_t arp_entry_base(struct in_addr ip_addr) {
   // Take the top bits -- they should be best-mixed by the prime
@@ -113,19 +164,16 @@ bool arp_fetch_address(struct in_addr requesting_ip, struct in_addr ip_addr,
     switch (entry->state) {
       case ARP_STATE_REQUESTED: {
         // There's an in-flight entry, but let's see if it's time to retry
-        time_ms_t wait_ms = time_since_ms(now_ms, entry->last_request_ms);
-        time_ms_t backoff_ms = entry->last_backoff_ms;
-        assert(backoff_ms <= ARP_REQUEST_RETRY_MAX_MS);
+        time_ms_t wait_ms = time_since_ms(now_ms, entry->last_state_ms);
+        assert(entry->backoff <= ARP_REQUEST_RETRY_BACKOFF_MAX);
+        time_ms_t backoff_ms = wait_ms << ((time_ms_t)entry->backoff);
         assert(backoff_ms >= ARP_REQUEST_RETRY_INITIAL_MS);
         if (wait_ms > backoff_ms) {
-          backoff_ms *= 2;
-          if (backoff_ms > ARP_REQUEST_RETRY_MAX_MS) {
-            backoff_ms = ARP_REQUEST_RETRY_MAX_MS;
+          arp_send_request(client_mac, ip_addr, requesting_ip);
+          entry->last_state_ms = now_ms;
+          if (entry->backoff < ARP_REQUEST_RETRY_BACKOFF_MAX) {
+            ++entry->backoff;
           }
-          entry->last_backoff_ms = backoff_ms;
-          entry->last_request_ms = now_ms;
-          entry->last_requesting_ip = requesting_ip;
-          arp_send_request(requesting_ip, ip_addr);
         }
         return false;
       }
@@ -138,12 +186,11 @@ bool arp_fetch_address(struct in_addr requesting_ip, struct in_addr ip_addr,
           return false;
         }
         if (entry->state == ARP_STATE_REFRESHING) {
-          if (time_since_ms(now_ms, entry->last_request_ms) >
-              ARP_REQUEST_RETRY_MAX_MS) {
-            entry->last_backoff_ms = ARP_REQUEST_RETRY_MAX_MS;
-            entry->last_request_ms = now_ms;
-            entry->last_requesting_ip = requesting_ip;
-            arp_send_request(requesting_ip, ip_addr);
+          if (time_since_ms(now_ms, entry->last_state_ms) >
+              (ARP_REQUEST_RETRY_INITIAL_MS
+               << (time_ms_t)ARP_REQUEST_RETRY_BACKOFF_MAX)) {
+            arp_send_request(client_mac, ip_addr, requesting_ip);
+            entry->last_state_ms = now_ms;
           }
         }
         *out_mac_addr = entry->mac_addr;
@@ -161,16 +208,25 @@ bool arp_fetch_address(struct in_addr requesting_ip, struct in_addr ip_addr,
   best_bin = arp_find_entry_to_evict(base);
 
   struct arp_cache_entry *entry = &arp_cache[best_bin];
+
+  if (very_verbose_log && (entry->state != ARP_STATE_UNUSED)) {
+    logf(
+        "arp: neighborhood of %lu full, evicting entry %lu (%s, importance "
+        "%lu) ",
+        (unsigned long)base, (unsigned long)best_bin, inet_ntoa(entry->ip_addr),
+        (unsigned long)entry->importance);
+    logf("to hold request for %s\n", inet_ntoa(ip_addr));
+  }
+
   entry->ip_addr = ip_addr;
   entry->mac_addr = broadcast_mac;
   entry->state = ARP_STATE_REQUESTED;
+  entry->backoff = 0;
   entry->importance = 1;
-  entry->last_backoff_ms = ARP_REQUEST_RETRY_INITIAL_MS;
   entry->last_seen_ms = now_ms;
-  entry->last_request_ms = now_ms;
-  entry->last_requesting_ip = requesting_ip;
+  entry->last_state_ms = now_ms;
 
-  arp_send_request(requesting_ip, ip_addr);
+  arp_send_request(client_mac, ip_addr, requesting_ip);
 
   return false;
 }
@@ -178,28 +234,89 @@ bool arp_fetch_address(struct in_addr requesting_ip, struct in_addr ip_addr,
 bool arp_process_frame(struct eth_packet *frame) {
   // Find any relevant entry and update it
   if (ntohs(frame->hdr.h_proto) != ETH_P_ARP) {
-    // Not even trying to be ARP
+    // Not even trying to be ARP?
     return false;
   }
 
-  // TODO finish implementation
-
   // We take ownership of the packet from here, and are responsible for
   // deallocating it! Be careful about returning early.
-  if ((frame->recv_size >= sizeof frame->arp) &&
-      ((ntohs(frame->arp.hrd) == 1) || (ntohs(frame->arp.hrd) == 6)) &&
-      (frame->arp.hln == ETH_ALEN) && (frame->arp.pln == IP_CHECKSUM)) {
-    switch (ntohs(frame->arp.op)) {
-      case ARPOP_REQUEST: {
-        ///if(frame->hdr.)
-      } break;
-      case ARPOP_REPLY: {
-      } break;
-      default:  // Do nothing
-        break;
+  if ((frame->recv_size >= sizeof frame->hdr + sizeof frame->arp) &&
+      ((ntohs(frame->arp.arp_hrd) == 1) || (ntohs(frame->arp.arp_hrd) == 6)) &&
+      (frame->arp.arp_hln == ETH_ALEN) &&
+      (frame->arp.arp_pln == sizeof(struct in_addr)) &&
+      (ntohs(frame->arp.arp_pro) == ETH_P_IP)) {
+    // Packet is basically well-formed, but do some more checks
+    if (memcmp(&frame->hdr.h_source, &broadcast_mac, ETH_ALEN) == 0) {
+      if (verbose_log) {
+        logf("arp: dropping bad packet; from broadcast address\n");
+        if (very_verbose_log) {
+          hex_dump(stdlog, frame->eth_raw, frame->recv_size);
+        }
+      }
+      goto skip_processing;
+    }
+    if (memcmp(&frame->arp.arp_sha, &frame->hdr.h_source, ETH_ALEN) != 0) {
+      if (verbose_log) {
+        logf("arp: dropping bad packet; from %s, ",
+             ether_ntoa((struct ether_addr *)&frame->hdr.h_dest));
+        logf("but arp arp_sha is %s\n",
+             ether_ntoa((struct ether_addr *)&frame->arp.arp_sha));
+      }
+      goto skip_processing;
+    }
+    bool is_request = (ntohs(frame->arp.arp_op) == ARPOP_REQUEST);
+    bool to_broadcast =
+        (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0);
+    if (!is_request && to_broadcast) {
+      if (verbose_log) {
+        logf(
+            "arp: dropping bad packet; non-request from %s, to broadcast "
+            "address",
+            ether_ntoa((struct ether_addr *)&frame->hdr.h_source));
+      }
+      goto skip_processing;
+    }
+    if (is_request && !to_broadcast) {
+      if (very_verbose_log) {
+        logf("arp: dropping bad packet; request from %s, ",
+             ether_ntoa((struct ether_addr *)&frame->hdr.h_source));
+        logf("to non-broadcast %s\n",
+             ether_ntoa((struct ether_addr *)&frame->hdr.h_dest));
+      }
+      goto skip_processing;
+    }
+
+    if (client_ready &&
+        (memcmp(&frame->hdr.h_source, &client_mac, ETH_ALEN) == 0)) {
+      if (verbose_log) {
+        logf("arp: dropping bad packet; appears to be from self");
+      }
+      goto skip_processing;
+    }
+
+    if (client_ready &&
+        (*(in_addr_t *)frame->arp.arp_spa == client_ip.s_addr)) {
+      // Somebody else has our address?
+      logf("arp: conflict! address %s also claimed by %s (we are %s)\n",
+           inet_ntoa(client_ip),
+           ether_ntoa((struct ether_addr *)&frame->hdr.h_source),
+           ether_ntoa((struct ether_addr *)&client_mac));
+      arp_send_announce(client_mac, client_ip);
+      goto skip_processing;
+    } else if (is_proper_ip_address(*(struct in_addr *)&frame->arp.arp_spa)) {
+      arp_merge_entry(*(struct ether_addr *)&frame->hdr.h_source,
+                      *(struct in_addr *)frame->arp.arp_spa);
+    }
+
+    if (is_request && (*(in_addr_t *)frame->arp.arp_tpa == client_ip.s_addr) &&
+        is_proper_ip_address(client_ip)) {
+      // Proper request, make a reply!
+      arp_send_response(client_mac, client_ip,
+                        *(struct ether_addr *)&frame->arp.arp_sha,
+                        *(struct in_addr *)&frame->arp.arp_spa);
     }
   }
-
+skip_processing:
   free_packet_buf(frame);
   return true;
 }
@@ -210,49 +327,183 @@ void arp_snoop_ip_frame(struct eth_packet const *frame) {
   (void)frame;
 }
 
-void arp_send_request(struct in_addr requesting_ip, struct in_addr target_ip) {
-  struct eth_packet *frame = alloc_packet_buf();
-  if (frame == NULL) {
-    // alloc fail
+void arp_merge_entry(struct ether_addr merge_mac, struct in_addr merge_ip) {
+  // You can't tell me to send packets to broadcast, sorry
+  assert(memcmp(&merge_mac, &broadcast_mac, ETH_ALEN) != 0);
+  assert(memcmp(&merge_mac, &zero_mac, ETH_ALEN) != 0);
+  // This should be a specific external IP address we could plausibly send to
+  assert(is_proper_ip_address(merge_ip));
+  // And it should not be *our* IP address -- ideally that kind of conflict is
+  // something we would notify the user about (but it should be logged
+  // elsewhere)
+  assert(merge_ip.s_addr != client_ip.s_addr);
+
+  // Is there already a valid or in-flight cache entry?
+  uint32_t base = arp_entry_base(merge_ip);
+  uint32_t best_bin = arp_find_entry(base, merge_ip);
+  if (best_bin >= ARP_CACHE_SIZE) {
+    if (very_verbose_log) {
+      logf("arp: trying to place %s, looking for a free entry\n",
+           inet_ntoa(merge_ip));
+    }
+    best_bin = arp_find_entry_to_evict(base);
+  }
+  if (best_bin >= ARP_CACHE_SIZE) {
+    // No room in the cache, just forget it
     return;
   }
 
+  struct arp_cache_entry *entry = &arp_cache[best_bin];
+  if ((entry->state != ARP_STATE_UNUSED) &&
+      (entry->ip_addr.s_addr != merge_ip.s_addr)) {
+    // This is an unsolicited ARP: if we had asked for it, there should be a
+    // matching entry in ARP_STATE_REQUESTED with nonzero importance. We should
+    // be careful not to evict anything more important -- conflict markers or
+    // things explicitly requested (i.e. with nonzero importance).
+    if ((entry->importance > 0) || (entry->state == ARP_STATE_CONTENDED)) {
+      return;
+    }
+    if (very_verbose_log && (entry->state != ARP_STATE_UNUSED)) {
+      logf(
+          "arp: neighborhood of %lu full, evicting entry %lu (%s, importance "
+          "%lu) ",
+          (unsigned long)base, (unsigned long)best_bin,
+          inet_ntoa(entry->ip_addr), (unsigned long)entry->importance);
+      logf("to hold unsolicited %s\n", inet_ntoa(merge_ip));
+    }
+    memset(entry, 0, sizeof *entry);
+    assert(entry->state == ARP_STATE_UNUSED);
+  }
+
+  if (entry->state == ARP_STATE_UNUSED) {
+    // First observation of an unsolicited ARP -- init and get out
+    entry->ip_addr = merge_ip;
+    entry->mac_addr = merge_mac;
+    entry->state = ARP_STATE_COOLDOWN;
+    assert(entry->backoff == 0);
+    assert(entry->importance == 0);
+    entry->last_seen_ms = now_ms;
+    entry->last_state_ms = now_ms;
+    return;
+  }
+
+  // At this point we should have a valid entry (which we sorta check now), and
+  // it is not fresh (which we check in stages) and should have been aged
+  // properly (which we don't really check)
+  assert(entry->state != ARP_STATE_UNUSED);
+  assert(entry->ip_addr.s_addr == merge_ip.s_addr);
+
+  // Update the last-seen time
+  entry->last_seen_ms = now_ms;
+
+  if (entry->state == ARP_STATE_REQUESTED) {
+    // First response we've seen for this entry, record it and go to cooldown
+    assert(memcmp(&entry->mac_addr, &broadcast_mac, ETH_ALEN) == 0);
+    entry->state = ARP_STATE_COOLDOWN;
+    entry->mac_addr = merge_mac;
+  } else if (memcmp(&merge_mac, &entry->mac_addr, ETH_ALEN) != 0) {
+    // Conflicting advertisement! Go to contended if we're not already there and
+    // (re)start the timeout
+    entry->state = ARP_STATE_CONTENDED;
+    if (very_verbose_log) {
+      logf("arp: contention over %s; previously observed %s, ",
+           inet_ntoa(entry->ip_addr), ether_ntoa(&entry->mac_addr));
+      logf("now claimed by %s\n", ether_ntoa(&merge_mac));
+    }
+    entry->last_state_ms = now_ms;
+  } else if (entry->state == ARP_STATE_REFRESHING) {
+    assert(memcmp(&merge_mac, &entry->mac_addr, ETH_ALEN) == 0);
+    entry->state = ARP_STATE_VALID;
+  } else {
+    assert(memcmp(&merge_mac, &entry->mac_addr, ETH_ALEN) == 0);
+    assert((entry->state == ARP_STATE_COOLDOWN) ||
+           (entry->state == ARP_STATE_CONTENDED) ||
+           (entry->state == ARP_STATE_VALID));
+    // Nothing to do except the last-seen update we already did!
+  }
+}
+
+void arp_send_announce(struct ether_addr announce_mac,
+                       struct in_addr announce_ip) {
+  if (arp_announce_cooling_down &&
+      (time_since_ms(now_ms, arp_last_announce_ms) <
+       ARP_ANNOUNCE_COOLDOWN_MS)) {
+    return;
+  }
+
+  arp_send_request(announce_mac, announce_ip, announce_ip);
+
+  arp_announce_cooling_down = true;
+  arp_last_announce_ms = now_ms;
+}
+
+void arp_send_request(struct ether_addr from_mac, struct in_addr from_ip,
+                      struct in_addr requesting_ip) {
+  if (!is_proper_ip_address(from_ip) ||
+      (memcmp(&from_mac, &broadcast_mac, ETH_ALEN) == 0)) {
+    return;
+  }
+
+  struct eth_packet *frame = alloc_packet_buf();
+  if (frame == NULL) {
+    // Alloc fail -- not fatal
+    if (verbose_log) {
+      logf("arp: packet alloc fail in arp_send_announce\n");
+    }
+    return;
+  }
+
+  // An announce is constructed as if we were asking ourselves for our own
+  // address
   memcpy(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN);
-  memcpy(&frame->hdr.h_source, &client_mac, ETH_ALEN);
+  memcpy(&frame->hdr.h_source, &from_mac, ETH_ALEN);
   frame->hdr.h_proto = htons(ETH_P_ARP);
-  frame->arp.hrd = htons(ETH_P_ARP);
-  frame->arp.pro = htons(ETH_P_IP);
-  frame->arp.hln = sizeof(struct ether_addr);
-  frame->arp.pln = sizeof(struct in_addr);
-  frame->arp.op = htons(1);
-  frame->arp.sha = client_mac;
-  frame->arp.spa = requesting_ip;
-  frame->arp.tha = broadcast_mac;
-  frame->arp.tpa = target_ip;
+  frame->arp.arp_hrd = htons(ARPHRD_ETHER);
+  frame->arp.arp_pro = htons(ETH_P_IP);
+  frame->arp.arp_hln = sizeof(struct ether_addr);
+  frame->arp.arp_pln = sizeof(struct in_addr);
+  frame->arp.arp_op = htons(1);
+  *(struct ether_addr *)&frame->arp.arp_sha = from_mac;
+  *(struct in_addr *)&frame->arp.arp_spa = from_ip;
+  memset(&frame->arp.arp_tha, 0, sizeof frame->arp.arp_tha);
+  *(struct in_addr *)&frame->arp.arp_tpa = requesting_ip;
+
   frame->recv_size = sizeof(frame->hdr) + sizeof(frame->arp);
 
   net_send_link_frame(frame);
 }
 
-void arp_send_announce(struct in_addr ip_addr, struct ether_addr mac_addr) {
-  struct eth_packet *frame = alloc_packet_buf();
-  if (frame == NULL) {
-    // alloc fail
+void arp_send_response(struct ether_addr from_mac, struct in_addr from_ip,
+                       struct ether_addr to_mac, struct in_addr to_ip) {
+  assert(is_proper_ip_address(from_ip) && is_proper_ip_address(to_ip));
+  if (!is_proper_ip_address(client_ip) ||
+      (memcmp(&client_mac, &broadcast_mac, ETH_ALEN) == 0)) {
+    // We aren't properly configured, let's not share
     return;
   }
 
-  memcpy(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN);
-  memcpy(&frame->hdr.h_source, &client_mac, ETH_ALEN);
+  struct eth_packet *frame = alloc_packet_buf();
+  if (frame == NULL) {
+    // Alloc fail -- not fatal
+    if (verbose_log) {
+      logf("arp: packet alloc fail in arp_send_response\n");
+    }
+    return;
+  }
+
+  memcpy(&frame->hdr.h_dest, &to_mac, ETH_ALEN);
+  memcpy(&frame->hdr.h_source, &from_mac, ETH_ALEN);
   frame->hdr.h_proto = htons(ETH_P_ARP);
-  frame->arp.hrd = htons(ARPHRD_ETHER);
-  frame->arp.pro = htons(ETH_P_IP);
-  frame->arp.hln = sizeof(struct ether_addr);
-  frame->arp.pln = sizeof(struct in_addr);
-  frame->arp.op = htons(1);
-  frame->arp.sha = mac_addr;
-  frame->arp.spa = ip_addr;
-  memset(&frame->arp.tha, 0, sizeof frame->arp.tha);
-  frame->arp.tpa = ip_addr;
+  frame->arp.arp_hrd = htons(ARPHRD_ETHER);
+  frame->arp.arp_pro = htons(ETH_P_IP);
+  frame->arp.arp_hln = sizeof(struct ether_addr);
+  frame->arp.arp_pln = sizeof(struct in_addr);
+  frame->arp.arp_op = htons(1);
+  *(struct ether_addr *)&frame->arp.arp_sha = from_mac;
+  *(struct in_addr *)&frame->arp.arp_spa = from_ip;
+  *(struct ether_addr *)&frame->arp.arp_tha = to_mac;
+  *(struct in_addr *)&frame->arp.arp_tpa = to_ip;
+
   frame->recv_size = sizeof(frame->hdr) + sizeof(frame->arp);
 
   net_send_link_frame(frame);
@@ -263,34 +514,87 @@ bool arp_has_work(void) { return false; }
 void arp_process_queued(void) {}
 
 void arp_idle(void) {
-  time_ms_t cycle_ms = time_since_ms(now_ms, arp_idle_cycle_start_ms);
-  uint32_t check_counter_target;
-  if (cycle_ms < ARP_IDLE_SCAN_PERIOD_MS * 2) {
-    check_counter_target = cycle_ms * ARP_CACHE_SIZE / ARP_IDLE_SCAN_PERIOD_MS;
-  } else {
+  // Check and clear the cooldown timer so it doesn't do anything wonky if we
+  // don't announce for a really really long time
+  if (arp_announce_cooling_down &&
+      (time_since_ms(now_ms, arp_last_announce_ms) >=
+       ARP_ANNOUNCE_COOLDOWN_MS)) {
+    arp_announce_cooling_down = false;
+  }
+
+  time_ms_t prev_cycle_ms =
+      arp_idle_check_counter * ARP_IDLE_SCAN_PERIOD_MS / ARP_CACHE_SIZE;
+  uint32_t check_count;
+  assert(prev_cycle_ms < ARP_IDLE_SCAN_PERIOD_MS);
+  if (is_time_past_ms(now_ms, arp_idle_target_ms + prev_cycle_ms +
+                                  ARP_IDLE_SCAN_PERIOD_MS)) {
     // We are very far behind (or just experienced some kind of clock hiccup).
-    // Reset the time reference and set the target so we check half the table --
-    // if this was just a hiccup, that's probably not *too* much, and if we're
-    // behind at least we're making progress.
-    check_counter_target =
-        (arp_idle_check_counter + ARP_CACHE_SIZE / 2) & (ARP_CACHE_SIZE - 1);
-    arp_idle_cycle_start_ms = now_ms;
+    // Reset the time reference and check the whole table.
+    arp_idle_target_ms = now_ms - prev_cycle_ms + ARP_IDLE_SCAN_PERIOD_MS;
+    check_count = ARP_CACHE_SIZE;
+  } else {
+    check_count = time_since_ms(now_ms, arp_idle_target_ms) * ARP_CACHE_SIZE /
+                      ARP_IDLE_SCAN_PERIOD_MS -
+                  arp_idle_check_counter;
+    assert(check_count <= ARP_CACHE_SIZE);
+    if (is_time_past_ms(now_ms, arp_idle_target_ms + ARP_IDLE_SCAN_PERIOD_MS)) {
+      arp_idle_target_ms += ARP_IDLE_SCAN_PERIOD_MS;
+    }
   }
   assert(arp_idle_check_counter < ARP_CACHE_SIZE);
-  if (arp_idle_check_counter != check_counter_target) {
+  if (check_count == 0) {
     return;
   }
   if (very_verbose_log) {
-    logf(
-        "arp: idle %lu ms into %lu ms cycle, checking %lu entries, to %lu (of "
-        "%lu)",
-        (unsigned long)cycle_ms, (unsigned long)ARP_IDLE_SCAN_PERIOD_MS,
-        (unsigned long)((check_counter_target + ARP_CACHE_SIZE -
-                         arp_idle_check_counter) %
-                        (ARP_CACHE_SIZE - 1)),
-        (unsigned long)check_counter_target, (unsigned long)ARP_CACHE_SIZE);
+    logf("arp: idle, checking %lu/%lu entries", (unsigned long)check_count,
+         (unsigned long)ARP_CACHE_SIZE);
   }
-  while (arp_idle_check_counter != check_counter_target) {
+  for (uint32_t j = 0; j < check_count; ++j) {
+#if !defined(NDEBUG)
+    if (very_verbose_log && (arp_idle_check_counter == 0)) {
+      logf("arp: ARP cache debug dump\n");
+      logf("arp: || %15s || %16s || %9s || %2s || %6s || %10s || %10s ||\n",
+           "IP address", "MAC address", "state", "bk", "import", "seen age",
+           "state age");
+      for (uint32_t i = 0; i < ARP_CACHE_SIZE; ++i) {
+        struct arp_cache_entry *entry = &arp_cache[i];
+        char const *state_str;
+        char unk_state_buf[14];
+        switch (entry->state) {
+          case ARP_STATE_UNUSED:
+            state_str = "UNUSED";
+            break;
+          case ARP_STATE_REQUESTED:
+            state_str = "REQUESTED";
+            break;
+          case ARP_STATE_COOLDOWN:
+            state_str = "COOLDOWN";
+            break;
+          case ARP_STATE_CONTENDED:
+            state_str = "CONTENDED";
+            break;
+          case ARP_STATE_REFRESHING:
+            state_str = "REFRESHING";
+            break;
+          case ARP_STATE_VALID:
+            state_str = "VALID";
+            break;
+          default:
+            snprintf(unk_state_buf, sizeof unk_state_buf, "<#%d>",
+                     (int)entry->state);
+            state_str = unk_state_buf;
+            break;
+        }
+        logf("arp: | %16s | %17s | %10s | %3d | %7lu | %11lu | %11lu |\n",
+             inet_ntoa(entry->ip_addr), ether_ntoa(&entry->mac_addr), state_str,
+             (int)entry->backoff, (unsigned long)entry->importance,
+             (unsigned long)time_since_ms(now_ms, entry->last_seen_ms),
+             (unsigned long)time_since_ms(now_ms, entry->last_state_ms));
+      }
+      logf("arp: continue idle check");
+    }
+#endif
+
     if (very_verbose_log) {
       logf(".");
     }
@@ -311,9 +615,9 @@ void arp_idle(void) {
           // all. Actually used entries should always be preferred over
           // speculatively recorded ones, regardless of age.
           if (very_verbose_log) {
-            char ip_str[20];
-            inet_ntop(AF_INET, &entry->ip_addr, ip_str, sizeof ip_str);
-            logf("(reduce %s; %u->%u)", ip_str, (unsigned)entry->importance,
+            logf("(reduce %s; %u->%u)",
+                 inet_ntoa(*(struct in_addr *)&entry->ip_addr),
+                 (unsigned)entry->importance,
                  (unsigned)(entry->importance >> 1));
           }
           entry->importance >>= 1;
@@ -348,6 +652,10 @@ uint32_t arp_find_entry_to_evict(uint32_t base) {
   arp_importance_t best_importance = ARP_IMPORTANCE_MAX;
   time_ms_t best_age = 0;
   for (uint32_t i = 0; i < ARP_CACHE_ASSOC; ++i) {
+    if (very_verbose_log && (i > 0)) {
+      logf("arp: exploring neighborhood of %lu: %lu", (unsigned long)base,
+           (unsigned long)i);
+    }
     struct arp_cache_entry *entry =
         &arp_cache[(base + i) & (ARP_CACHE_SIZE - 1)];
     arp_age_entry(entry);
@@ -356,22 +664,22 @@ uint32_t arp_find_entry_to_evict(uint32_t base) {
       default:
         assert(entry->state == ARP_STATE_UNUSED);
       case ARP_STATE_UNUSED:
-        // Short-circuit: unused entries have zero cost so we should always take
-        // the first available if there is one
+        // Short-circuit: unused entries have zero cost so we should always
+        // take the first available if there is one
         best_bin = entry - arp_cache;
         goto best_bin_early_out;
       case ARP_STATE_VALID:
       case ARP_STATE_REFRESHING:
-        // If the entry is valid, at least we did send (or could have sent) some
-        // packets to the address, so evicting this entry doesn't imply we're
-        // impeding progress
+        // If the entry is valid, at least we did send (or could have sent)
+        // some packets to the address, so evicting this entry doesn't imply
+        // we're impeding progress
         entry_state_class = 1;
         break;
       case ARP_STATE_REQUESTED:
       case ARP_STATE_COOLDOWN:
         // If the entry is requested or in cooldown, evicting it may cause
-        // starvation, so we want to artificially raise the importance of those
-        // entries
+        // starvation, so we want to artificially raise the importance of
+        // those entries
         entry_state_class = 2;
         break;
       case ARP_STATE_CONTENDED:
@@ -381,34 +689,31 @@ uint32_t arp_find_entry_to_evict(uint32_t base) {
         break;
     }
 
-    if (entry->importance == 0) {
-      // This entry has never actually been fetched by another system, so
-      // whatever state it's in we only got there by observing random packets;
-      // in that special case, forget about it.
-
-      // Contention over IP addresses we're not interacting with can't affect
-      // our behaviour. If we begin an interaction later, we'll use the normal
-      // cooldown process to try to ensure safety at that time, and if that's
-      // not a good enough solution we are redesigning this whole thing anyway.
-      // This is networking, it's all "best effort"!
-
-      best_bin = entry - arp_cache;
-      goto best_bin_early_out;
-    } else if (entry_state_class > best_state_class) {
-      // Ruled out -- this entry is a more important state class
-      continue;
-    } else if (entry_state_class == best_state_class) {
-      // Equivalent state class
-      if (entry->importance > best_importance) {
-        // Ruled out -- this entry is more important
-        continue;
-      } else if (entry->importance == best_importance) {
-        // Equivalent importance
-        if (time_since_ms(now_ms, entry->last_seen_ms) >= best_age) {
-          // Ruled out -- this entry is at least as old
+    if (best_bin < ARP_CACHE_SIZE) {
+      // Only start comparing if we have a possibility to compare
+      if (entry->importance == 0) {
+        // This entry has never actually been fetched by another system. The
+        // only thing more important is another such record that's newer.
+        if ((best_importance == 0) &&
+            (time_since_ms(now_ms, entry->last_seen_ms) >= best_age)) {
           continue;
         }
-        // Otherwise fall through
+      } else if (entry_state_class > best_state_class) {
+        // Ruled out -- this entry is a more important state class
+        continue;
+      } else if (entry_state_class == best_state_class) {
+        // Equivalent state class
+        if (entry->importance > best_importance) {
+          // Ruled out -- this entry is more important
+          continue;
+        } else if (entry->importance == best_importance) {
+          // Equivalent importance
+          if (time_since_ms(now_ms, entry->last_seen_ms) >= best_age) {
+            // Ruled out -- this entry is at least as old
+            continue;
+          }
+          // Otherwise fall through
+        }
       }
     }
     // If it's not ruled out, it's ruled in!
@@ -436,7 +741,8 @@ static void arp_age_entry(struct arp_cache_entry *entry) {
   }
 
   assert(is_proper_ip_address(entry->ip_addr));
-  assert(!memcmp(&entry->mac_addr, &broadcast_mac, sizeof(entry->mac_addr)));
+  assert(memcmp(&entry->mac_addr, &broadcast_mac, ETH_ALEN) != 0);
+  assert(memcmp(&entry->mac_addr, &zero_mac, ETH_ALEN) != 0);
 
   time_ms_t entry_age = time_since_ms(now_ms, entry->last_seen_ms);
 
@@ -446,9 +752,7 @@ static void arp_age_entry(struct arp_cache_entry *entry) {
     // Invalidate entry -- it's very very stale, or it's a contention record
     // that's past due
     if (very_verbose_log) {
-      char ip_str[20];
-      inet_ntop(AF_INET, &entry->ip_addr, ip_str, sizeof ip_str);
-      logf("(age-out %s%s)", ip_str,
+      logf("(age-out %s%s)", inet_ntoa(*(struct in_addr *)&entry->ip_addr),
            entry->state == ARP_STATE_CONTENDED ? " CTD" : "");
     }
     memset(entry, 0, sizeof *entry);
@@ -457,14 +761,15 @@ static void arp_age_entry(struct arp_cache_entry *entry) {
     return;
   }
 
-  if ((entry->state == ARP_STATE_COOLDOWN) && (entry_age >= ARP_COOLDOWN_MS)) {
+  if ((entry->state == ARP_STATE_COOLDOWN) &&
+      (time_since_ms(now_ms, entry->last_state_ms) >= ARP_COOLDOWN_MS)) {
     entry->state = ARP_STATE_VALID;
     // Fall through! A very stale "cooldown" should go direct to "refreshing",
     // via the following logic. This shouldn't be a common case, but suppose a
     // packet gets dropped from the send queue while it's still pending ARP
     // confirmation -- then the send code will stop reconfirming status here,
-    // and it could be arbitrarily long (depending on the arp_idle) before that
-    // entry gets looked at again.
+    // and it could be arbitrarily long (depending on the arp_idle) before
+    // that entry gets looked at again.
   }
 
   if ((entry->state == ARP_STATE_VALID) && (entry_age >= ARP_REFRESH_MS)) {

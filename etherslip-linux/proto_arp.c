@@ -653,7 +653,7 @@ uint32_t arp_find_entry_to_evict(uint32_t base) {
   time_ms_t best_age = 0;
   for (uint32_t i = 0; i < ARP_CACHE_ASSOC; ++i) {
     if (very_verbose_log && (i > 0)) {
-      logf("arp: exploring neighborhood of %lu: %lu", (unsigned long)base,
+      logf("arp: exploring neighborhood of %lu: %lu\n", (unsigned long)base,
            (unsigned long)i);
     }
     struct arp_cache_entry *entry =

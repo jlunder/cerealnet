@@ -10,11 +10,10 @@
 #include <limits.h>
 #include <net/if.h>
 #include <net/if_arp.h>
-#include <net/if_slip.h>
 #include <netinet/ether.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 #include <netpacket/packet.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -76,7 +75,7 @@
 
 // big enough for a 9k jumbo frame
 #define MAX_PACKET_SIZE (1024 * 10 - sizeof(size_t))
-#define PACKET_POOL_SIZE 6
+#define PACKET_POOL_SIZE 8
 
 #define SER_IDX 0
 #if USE_IF_ETH
@@ -112,29 +111,9 @@ struct dhcp_msg {
   uint8_t options[312];
 } __attribute__((packed));
 
-struct arp_msg {
-  uint16_t hrd;  // 1 or 6? -- hardware type
-  uint16_t pro;  // 0x800 = ETH_P_IP -- protocol type
-  uint8_t hln;   // 6 -- MAC len
-  uint8_t pln;   // 4 -- IPv4 address len
-  uint16_t op;   // 1=ARP req, rep, 3=RARP req, rep, 5=DRARP req, rep, err,
-                 // 8=InARP req, rep
-  struct ether_addr sha;
-  struct in_addr spa;
-  struct ether_addr tha;
-  struct in_addr tpa;
-} __attribute__((packed));
-
 struct ip_packet {
   union {
-    struct {
-      struct iphdr hdr;
-      union {
-        uint8_t ip_payload[MAX_PACKET_SIZE - sizeof(struct iphdr) -
-                           sizeof(struct ethhdr)];
-        struct dhcp_msg dhcp;
-      };
-    } __attribute__((packed));
+    struct iphdr hdr;
     uint8_t ip_raw[MAX_PACKET_SIZE - sizeof(struct ethhdr)];
   };
 } __attribute__((packed));
@@ -155,6 +134,22 @@ struct eth_packet {
 
 static_assert(sizeof(struct ethhdr) == ETH_HLEN);
 
+struct dhcp_info {
+  struct ether_addr client_mac;
+  struct ether_addr server_mac;
+  struct in_addr client_ip;
+  struct in_addr server_ip;
+  struct ether_addr chaddr;
+  bool client_to_broadcast;
+  bool client_to_server;
+  bool server_to_client;
+  bool bootp_request;
+  bool is_discover;
+  bool is_ack;
+  bool options_in_file;
+  bool options_in_sname;
+};
+
 typedef uint32_t time_ms_t;
 
 #define ETH_IP_SIZE(frame) (frame->recv_size - sizeof(struct ethhdr))
@@ -166,14 +161,11 @@ extern bool send_log;
 extern bool verbose_log;
 extern bool very_verbose_log;
 
-extern bool client_ready;
 extern uint32_t ser_bps;
 
 extern time_ms_t now_ms;
 
-extern struct eth_packet packet_pool[PACKET_POOL_SIZE];
-extern struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
-extern size_t packet_pool_unallocated_count;
+extern bool client_ready;
 
 // the MAC address we're applying to packets bridged from the SLIP interface
 extern struct ether_addr client_mac;
@@ -182,6 +174,10 @@ extern struct ether_addr const broadcast_mac;
 extern struct ether_addr const zero_mac;
 
 extern struct in_addr client_ip;
+
+extern struct eth_packet packet_pool[PACKET_POOL_SIZE];
+extern struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
+extern size_t packet_pool_unallocated_count;
 
 static inline time_ms_t time_ms_from_timespec(struct timespec ts) {
   return (time_ms_t)((ts.tv_sec * 1000000000LL + ts.tv_nsec) / 1000000LL);
@@ -211,13 +207,13 @@ void print_usage_and_exit(char const *argv0, char const *extra_message,
 void poll_loop(void);
 
 void client_process_frame(struct eth_packet *frame);
-bool client_forward_frame(struct eth_packet *frame);
+bool client_forward_net_frame(struct eth_packet *frame);
 
 // Process a received frame (used by poll_loop)
 void net_process_frame(struct eth_packet *frame);
 
 // Send a forwarded frame to the client via ser (internal)
-bool net_forward_frame(struct eth_packet *frame);
+bool net_forward_client_frame(struct eth_packet *frame);
 
 // Send a link-level frame via eth or pkt (used by client, arp)
 void net_send_link_frame(struct eth_packet *frame);
@@ -243,6 +239,11 @@ void arp_idle(void);
 
 // bool dhcp_snoop_request(struct eth_packet *frame);
 // bool dhcp_snoop_response(struct eth_packet *frame);
+
+bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info);
+
+bool dhcp_parse_options(uint8_t const *opts, size_t len,
+                        struct dhcp_info *out_info);
 
 void ser_init(char const *ser_dev_name);
 void ser_setup_pollfd(struct pollfd *pfd);

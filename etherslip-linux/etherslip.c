@@ -1,18 +1,17 @@
 #include "etherslip.h"
 
+#define NET_FORWARD_QUEUE_SIZE 2
+
 bool recv_log = false;
 bool send_log = false;
 bool verbose_log = false;
 bool very_verbose_log = false;
 
-bool client_ready = false;
 uint32_t ser_bps = 115200;
 
 time_ms_t now_ms = 0;
 
-struct eth_packet packet_pool[PACKET_POOL_SIZE];
-struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
-size_t packet_pool_unallocated_count = 0;
+bool client_ready = false;
 
 struct ether_addr client_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr host_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
@@ -20,6 +19,14 @@ struct ether_addr const broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr const zero_mac = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
 struct in_addr client_ip = {0};
+
+struct eth_packet packet_pool[PACKET_POOL_SIZE];
+struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
+size_t packet_pool_unallocated_count = 0;
+
+struct eth_packet *net_forward_queue[NET_FORWARD_QUEUE_SIZE];
+size_t net_forward_queue_count = 0;
+size_t net_forward_queue_tail = 0;
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
@@ -293,7 +300,7 @@ void client_process_frame(struct eth_packet *frame) {
              (unsigned long)ETH_IP_SIZE(frame));
         hex_dump(stdlog, frame->ip.ip_raw, ETH_IP_SIZE(frame));
       }
-    } else if (client_forward_frame(frame)) {
+    } else if (net_forward_client_frame(frame)) {
       frame = NULL;
     }
 
@@ -302,21 +309,27 @@ void client_process_frame(struct eth_packet *frame) {
   }
 }
 
-bool client_forward_frame(struct eth_packet *frame) {
-  if (very_verbose_log && send_log) {
+bool client_forward_net_frame(struct eth_packet *frame) {
+  // Caller promises this is actually a valid IP packet
+  assert(validate_eth_ip_frame(frame));
+
+  // A complete packet and we're ready for it!
+  if (very_verbose_log && recv_log) {
     logf(
-        "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+        "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
         "sa=%s, ",
-        (unsigned long)ETH_IP_SIZE(frame),
+        (unsigned long)frame->recv_size,
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol,
         inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
     logf("da=%s\n", inet_ntoa(*(struct in_addr *)&frame->ip.hdr.daddr));
   }
 
-  frame->hdr.h_proto = htons(ETH_P_IP);
-  net_send_link_frame(frame);
+  // TODO rewrite IP addresses for masquerading if needed
+  // TODO filter in only IP packets actually sent to the client
 
+  // Pass frame on to serial send
+  ser_send(frame);
   return true;
 }
 
@@ -347,7 +360,7 @@ void net_process_frame(struct eth_packet *frame) {
       }
     } else {
 #endif
-      if (client_ready && net_forward_frame(frame)) {
+      if (client_ready && client_forward_net_frame(frame)) {
         frame = NULL;
       }
 #if USE_IF_ETH
@@ -371,28 +384,85 @@ void net_process_frame(struct eth_packet *frame) {
   }
 }
 
-bool net_forward_frame(struct eth_packet *frame) {
-  // Caller promises this is actually a valid IP packet
-  assert(validate_eth_ip_frame(frame));
-
-  // A complete packet and we're ready for it!
-  if (very_verbose_log && recv_log) {
+bool net_forward_client_frame(struct eth_packet *frame) {
+  if (very_verbose_log && send_log) {
     logf(
-        "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
+        "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%d, "
         "sa=%s, ",
-        (unsigned long)frame->recv_size,
+        (unsigned long)ETH_IP_SIZE(frame),
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol,
         inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
     logf("da=%s\n", inet_ntoa(*(struct in_addr *)&frame->ip.hdr.daddr));
+    hex_dump(stdlog, frame->eth_raw, frame->recv_size);
   }
 
-  // TODO rewrite IP addresses for masquerading if needed
-  // TODO filter in only IP packets actually sent to the client
+  assert(validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame)));
 
-  // Pass frame on to serial send
-  ser_send(frame);
-  return true;
+  if (frame->ip.hdr.protocol == IPPROTO_UDP) {
+    struct iphdr *ip = &frame->ip.hdr;
+    size_t header_len = ip->ihl * 4;
+    if (header_len + sizeof(struct udphdr) > ntohs(ip->tot_len)) {
+      // Not well formed
+      logf("net: runt UDP datagram from client\n");
+      return false;
+    }
+    struct udphdr *udp = (struct udphdr *)&frame->ip.ip_raw[header_len];
+    if (header_len + ntohs(udp->len) != ntohs(ip->tot_len)) {
+      // Not well formed
+      logf("net: UDP length %d does not match IP length %d\n",
+           (int)(header_len + ntohs(udp->len)), (int)ntohs(ip->tot_len));
+      return false;
+    }
+    logf("net: snooping possible DHCP packet\n");
+    // Snoop DHCP
+    struct dhcp_info info;
+    if (dhcp_parse_packet(frame, &info)) {
+      logf("net: snooping client DHCP");
+      logf(" from %s@%s", inet_ntoa(info.client_ip),
+           ether_ntoa(&info.client_mac));
+      logf(" to %s@%s\n", inet_ntoa(info.server_ip),
+           ether_ntoa(&info.server_mac));
+      logf("net: DHCP info, chaddr=%s", ether_ntoa(&info.chaddr));
+      if (info.client_to_broadcast) {
+        logf(" C->BC");
+      }
+      if (info.client_to_server) {
+        logf(" C->S");
+      }
+      if (info.server_to_client) {
+        logf(" S->C");
+      }
+      if (info.bootp_request) {
+        logf(" BREQ");
+      } else {
+        logf(" BREP");
+      }
+      if (info.is_discover) {
+        logf(" DISC");
+      }
+      if (info.is_ack) {
+        logf(" ACK");
+      }
+      logf("\n");
+    } else {
+      logf("net: doesn't seem to be valid BOOTP/DHCP\n");
+    }
+  }
+
+  if (client_ready) {
+    frame->hdr.h_proto = htons(ETH_P_IP);
+    *(struct ether_addr *)&frame->hdr.h_source = client_mac;
+
+    if (net_forward_queue_count >= NET_FORWARD_QUEUE_SIZE) {
+      if (verbose_log) {
+        logf("net: send queue full, dropping packet\n");
+      }
+      return true;
+    }
+  }
+
+  return false;
 }
 
 void net_send_link_frame(struct eth_packet *frame) {
@@ -407,7 +477,7 @@ void net_send_link_frame(struct eth_packet *frame) {
 
 bool net_has_work(void) { return false; }
 
-bool net_waiting(void) { return false; }
+bool net_waiting(void) { return net_forward_queue_count > 0; }
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size) {
@@ -421,6 +491,179 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
   checksum = ((checksum >> 16) + (checksum & 0xFFFF));
   checksum = ((checksum >> 16) + (checksum & 0xFFFF));
   return ~checksum & 0xFFFF;
+}
+
+bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info) {
+  assert(out_info != NULL);
+
+  struct iphdr *ip = &frame->ip.hdr;
+  size_t header_len = ip->ihl * 4;
+  struct udphdr *udp = (struct udphdr *)&frame->ip.ip_raw[header_len];
+
+  // These should already have been checked -- is it valid UDP?
+  assert(frame->ip.hdr.protocol == IPPROTO_UDP);
+  assert(header_len + sizeof(struct udphdr) <= ntohs(ip->tot_len));
+  assert(header_len + ntohs(udp->len) == ntohs(ip->tot_len));
+
+  // Clear our output struct
+  memset(out_info, 0, sizeof *out_info);
+
+  // In theory, we should compute/check the checksum, if it's set
+
+  if ((ntohs(udp->source) == 68) && (ntohs(udp->dest) == 67)) {
+    if (ip->daddr == INADDR_BROADCAST) {
+      out_info->client_to_broadcast = true;
+    } else {
+      out_info->client_to_server = true;
+    }
+    memcpy(&out_info->client_mac, &frame->hdr.h_source, ETH_ALEN);
+    memcpy(&out_info->client_ip, &ip->saddr, sizeof(struct in_addr));
+    memcpy(&out_info->server_mac, &frame->hdr.h_dest, ETH_ALEN);
+    memcpy(&out_info->server_ip, &ip->daddr, sizeof(struct in_addr));
+  } else if ((udp->source == 67) && (udp->dest == 68)) {
+    out_info->server_to_client = true;
+    memcpy(&out_info->client_mac, &frame->hdr.h_dest, ETH_ALEN);
+    memcpy(&out_info->client_ip, &ip->daddr, sizeof(struct in_addr));
+    memcpy(&out_info->server_mac, &frame->hdr.h_source, ETH_ALEN);
+    memcpy(&out_info->server_ip, &ip->saddr, sizeof(struct in_addr));
+  } else {
+    // Probably not BOOTP/DHCP at all
+    if (very_verbose_log) {
+      logf("dhcp_parse: ignoring packet from source port %u to dest port %u\n",
+           (unsigned short)ntohs(udp->source),
+           (unsigned short)ntohs(udp->dest));
+    }
+    return false;
+  }
+
+  if (ntohs(udp->len) < offsetof(struct dhcp_msg, options) + 4) {
+    if (verbose_log) {
+      logf("dhcp_parse: truncated datagram, %d\n", (int)ntohs(udp->len));
+    }
+    return false;
+  }
+
+  struct dhcp_msg *dhcp =
+      (struct dhcp_msg *)&frame->ip.ip_raw[header_len + sizeof(struct udphdr)];
+
+  if ((dhcp->htype != ARPHRD_ETHER) || (dhcp->hlen != ETH_ALEN)) {
+    if (verbose_log) {
+      logf("dhcp_parse: invalid htype/hlen %d/%d\n", (int)dhcp->htype,
+           (int)dhcp->hlen);
+    }
+    return false;
+  }
+  if (ntohl(*(uint32_t *)dhcp->options) != 0x63825363) {
+    if (verbose_log) {
+      logf("dhcp_parse: invalid options magic %08lX\n",
+           (unsigned long)*(uint32_t *)dhcp->options);
+    }
+    return false;
+  }
+
+  memcpy(&out_info->chaddr, &dhcp->chaddr, ETH_ALEN);
+
+  if (dhcp->op == 1) {
+    out_info->bootp_request = true;
+  } else if (dhcp->op == 2) {
+    out_info->bootp_request = false;
+  } else {
+    if (verbose_log) {
+      logf("dhcp_parse: invalid bootp op %d\n", (int)dhcp->op);
+    }
+    return false;
+  }
+
+  uint8_t *opts_end = &frame->ip.ip_raw[ntohs(ip->tot_len)];
+  if (!dhcp_parse_options(dhcp->options + 4, opts_end - (dhcp->options + 4),
+                          out_info)) {
+    return false;
+  }
+  if (out_info->options_in_file) {
+    if (!dhcp_parse_options(dhcp->file, sizeof dhcp->file, out_info)) {
+      return false;
+    }
+  }
+  if (out_info->options_in_sname) {
+    if (!dhcp_parse_options(dhcp->sname, sizeof dhcp->sname, out_info)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool dhcp_parse_options(uint8_t const *opts, size_t len,
+                        struct dhcp_info *out_info) {
+  size_t i = 0;
+  bool proper_termination = false;
+  while (i < len) {
+    uint8_t optcode = opts[i++];
+    if (optcode == 0x00) continue;
+    if (optcode == 0xFF) {
+      proper_termination = true;
+      break;
+    }
+    if (i >= len) {
+      if (verbose_log) {
+        logf("dhcp_parse: option %d overruns buffer at %d/%d\n", (int)optcode,
+             (int)(i - 1), (int)len);
+      }
+      return false;
+    }
+    uint8_t optlen = opts[i++];
+    if (i + optlen > len) {
+      if (verbose_log) {
+        logf("dhcp_parse: option %d with length %d overruns buffer at %d/%d\n",
+             (int)optcode, (int)optlen, (int)(i - 2), (int)len);
+      }
+      return false;
+    }
+    switch (optcode) {
+      case 52: {
+        if (optlen != 1) return false;
+        if (opts[i] < 1 || opts[i] > 3) {
+          if (verbose_log) {
+            logf(
+                "dhcp_parse: invalid option 52 (Option Overload), %d at "
+                "%d/%d\n",
+                (int)opts[i], (int)i, (int)len);
+          }
+          return false;
+        }
+        if ((opts[i] == 1) || (opts[i] == 3)) {
+          out_info->options_in_file = true;
+        }
+        if ((opts[i] == 2) || (opts[i] == 3)) {
+          out_info->options_in_sname = true;
+        }
+      } break;
+      case 53: {
+        if (optlen != 1) return false;
+        if (opts[i] < 1 || opts[i] > 8) {
+          if (verbose_log) {
+            logf(
+                "dhcp_parse: invalid option 53 (DHCP Message Type), %d at "
+                "%d/%d\n",
+                (int)opts[i], (int)i, (int)len);
+          }
+          return false;
+        }
+        if (opts[i] == 1) {
+          out_info->is_discover = true;
+        } else if (opts[i] == 5) {
+          out_info->is_ack = true;
+        }
+      } break;
+      default: {
+        // ignore
+      }
+    }
+    i += optlen;
+  }
+  if (!proper_termination && verbose_log) {
+    logf("dhcp_parse: options not properly terminated, at %d\n", (int)len);
+  }
+  return true;
 }
 
 bool validate_eth_ip_frame(struct eth_packet const *frame) {

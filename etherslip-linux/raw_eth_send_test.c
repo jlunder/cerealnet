@@ -168,7 +168,7 @@ int main(int argc, char *argv[]) {
   memcpy(&frame.arp.eth_ip.sha, &client_mac, ETH_ALEN);
   frame.arp.eth_ip.spa = client_ip;
   memcpy(&frame.arp.eth_ip.tha, &host_mac, ETH_ALEN);
-  frame.arp.eth_ip.tpa.s_addr = 0;
+  frame.arp.eth_ip.tpa = this_host_ip;
   frame.recv_size =
       sizeof(struct ethhdr) + sizeof(struct arphdr) + sizeof(struct arp_eth_ip);
 

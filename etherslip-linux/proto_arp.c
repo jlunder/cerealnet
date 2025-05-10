@@ -129,8 +129,7 @@ time_ms_t arp_last_announce_ms = 0;
 
 static_assert(((uint64_t)ARP_CACHE_SIZE * (uint64_t)ARP_IDLE_SCAN_PERIOD_MS) <
               UINT32_MAX);
-static_assert(((ARP_CACHE_SIZE - 1) | ((ARP_CACHE_SIZE - 1) >> 1)) ==
-              (ARP_CACHE_SIZE - 1));
+static_assert(IS_POW2(ARP_CACHE_SIZE));
 
 static uint32_t arp_find_entry(uint32_t base, struct in_addr ip_addr);
 static uint32_t arp_find_entry_to_evict(uint32_t base);
@@ -148,11 +147,25 @@ static inline uint32_t arp_entry_base(struct in_addr ip_addr) {
          (ARP_CACHE_SIZE - 1);
 }
 
+static inline struct in_addr arp_get_spa(struct ether_arp *arp) {
+  return *(struct in_addr *)&arp->arp_spa;
+}
+
+static inline struct in_addr arp_get_tpa(struct ether_arp *arp) {
+  return *(struct in_addr *)&arp->arp_tpa;
+}
+
 static void arp_age_entry(struct arp_cache_entry *entry);
 
 bool arp_fetch_address(struct in_addr requesting_ip, struct in_addr ip_addr,
                        bool permissive, struct ether_addr *out_mac_addr) {
-  assert(is_proper_ip_address(ip_addr));
+  // Shortcut for global or subnet broadcast
+  if (ip_is_broadcast(ip_addr) || (ip_equals(ip_addr, client_broadcast))) {
+    *out_mac_addr = broadcast_mac;
+    return true;
+  }
+
+  assert(ip_is_proper(ip_addr));
   assert(out_mac_addr != NULL);
 
   // Is there already a valid or in-flight cache entry?
@@ -160,7 +173,7 @@ bool arp_fetch_address(struct in_addr requesting_ip, struct in_addr ip_addr,
   uint32_t best_bin = arp_find_entry(base, ip_addr);
   if (best_bin < ARP_CACHE_SIZE) {
     struct arp_cache_entry *entry = &arp_cache[best_bin];
-    assert(entry->ip_addr.s_addr == ip_addr.s_addr);
+    assert(ip_equals(entry->ip_addr, ip_addr));
     switch (entry->state) {
       case ARP_STATE_REQUESTED: {
         // There's an in-flight entry, but let's see if it's time to retry
@@ -294,8 +307,7 @@ bool arp_process_frame(struct eth_packet *frame) {
       goto skip_processing;
     }
 
-    if (client_ready &&
-        (*(in_addr_t *)frame->arp.arp_spa == client_ip.s_addr)) {
+    if (client_ready && ip_equals(arp_get_spa(&frame->arp), client_ip)) {
       // Somebody else has our address?
       logf("arp: conflict! address %s also claimed by %s (we are %s)\n",
            inet_ntoa(client_ip),
@@ -303,13 +315,13 @@ bool arp_process_frame(struct eth_packet *frame) {
            ether_ntoa((struct ether_addr *)&client_mac));
       arp_send_announce(client_mac, client_ip);
       goto skip_processing;
-    } else if (is_proper_ip_address(*(struct in_addr *)&frame->arp.arp_spa)) {
+    } else if (ip_is_proper(*(struct in_addr *)&frame->arp.arp_spa)) {
       arp_merge_entry(*(struct ether_addr *)&frame->hdr.h_source,
                       *(struct in_addr *)frame->arp.arp_spa);
     }
 
-    if (is_request && (*(in_addr_t *)frame->arp.arp_tpa == client_ip.s_addr) &&
-        is_proper_ip_address(client_ip)) {
+    if (is_request && ip_equals(arp_get_tpa(&frame->arp), client_ip) &&
+        ip_is_proper(client_ip)) {
       // Proper request, make a reply!
       arp_send_response(client_mac, client_ip,
                         *(struct ether_addr *)&frame->arp.arp_sha,
@@ -332,11 +344,11 @@ void arp_merge_entry(struct ether_addr merge_mac, struct in_addr merge_ip) {
   assert(memcmp(&merge_mac, &broadcast_mac, ETH_ALEN) != 0);
   assert(memcmp(&merge_mac, &zero_mac, ETH_ALEN) != 0);
   // This should be a specific external IP address we could plausibly send to
-  assert(is_proper_ip_address(merge_ip));
+  assert(ip_is_proper(merge_ip));
   // And it should not be *our* IP address -- ideally that kind of conflict is
   // something we would notify the user about (but it should be logged
   // elsewhere)
-  assert(merge_ip.s_addr != client_ip.s_addr);
+  assert(!ip_equals(merge_ip, client_ip));
 
   // Is there already a valid or in-flight cache entry?
   uint32_t base = arp_entry_base(merge_ip);
@@ -355,7 +367,7 @@ void arp_merge_entry(struct ether_addr merge_mac, struct in_addr merge_ip) {
 
   struct arp_cache_entry *entry = &arp_cache[best_bin];
   if ((entry->state != ARP_STATE_UNUSED) &&
-      (entry->ip_addr.s_addr != merge_ip.s_addr)) {
+      !ip_equals(entry->ip_addr, merge_ip)) {
     // This is an unsolicited ARP: if we had asked for it, there should be a
     // matching entry in ARP_STATE_REQUESTED with nonzero importance. We should
     // be careful not to evict anything more important -- conflict markers or
@@ -391,7 +403,7 @@ void arp_merge_entry(struct ether_addr merge_mac, struct in_addr merge_ip) {
   // it is not fresh (which we check in stages) and should have been aged
   // properly (which we don't really check)
   assert(entry->state != ARP_STATE_UNUSED);
-  assert(entry->ip_addr.s_addr == merge_ip.s_addr);
+  assert(ip_equals(entry->ip_addr, merge_ip));
 
   // Update the last-seen time
   entry->last_seen_ms = now_ms;
@@ -439,7 +451,7 @@ void arp_send_announce(struct ether_addr announce_mac,
 
 void arp_send_request(struct ether_addr from_mac, struct in_addr from_ip,
                       struct in_addr requesting_ip) {
-  if (!is_proper_ip_address(from_ip) ||
+  if (!ip_is_proper(from_ip) ||
       (memcmp(&from_mac, &broadcast_mac, ETH_ALEN) == 0)) {
     return;
   }
@@ -475,8 +487,8 @@ void arp_send_request(struct ether_addr from_mac, struct in_addr from_ip,
 
 void arp_send_response(struct ether_addr from_mac, struct in_addr from_ip,
                        struct ether_addr to_mac, struct in_addr to_ip) {
-  assert(is_proper_ip_address(from_ip) && is_proper_ip_address(to_ip));
-  if (!is_proper_ip_address(client_ip) ||
+  assert(ip_is_proper(from_ip) && ip_is_proper(to_ip));
+  if (!client_ready || !ip_is_proper(client_ip) ||
       (memcmp(&client_mac, &broadcast_mac, ETH_ALEN) == 0)) {
     // We aren't properly configured, let's not share
     return;
@@ -508,10 +520,6 @@ void arp_send_response(struct ether_addr from_mac, struct in_addr from_ip,
 
   net_send_link_frame(frame);
 }
-
-bool arp_has_work(void) { return false; }
-
-void arp_process_queued(void) {}
 
 void arp_idle(void) {
   // Check and clear the cooldown timer so it doesn't do anything wonky if we
@@ -631,14 +639,14 @@ void arp_idle(void) {
 }
 
 uint32_t arp_find_entry(uint32_t base, struct in_addr ip_addr) {
-  assert(is_proper_ip_address(ip_addr));
+  assert(ip_is_proper(ip_addr));
 
   for (uint32_t i = 0; i < ARP_CACHE_ASSOC; ++i) {
     struct arp_cache_entry *entry =
         &arp_cache[(base + i) & (ARP_CACHE_SIZE - 1)];
     arp_age_entry(entry);
 
-    if ((entry->ip_addr.s_addr == ip_addr.s_addr) &&
+    if (ip_equals(entry->ip_addr, ip_addr) &&
         (entry->state != ARP_STATE_UNUSED)) {
       return entry - arp_cache;
     }
@@ -740,7 +748,7 @@ static void arp_age_entry(struct arp_cache_entry *entry) {
     return;
   }
 
-  assert(is_proper_ip_address(entry->ip_addr));
+  assert(ip_is_proper(entry->ip_addr));
   assert(memcmp(&entry->mac_addr, &broadcast_mac, ETH_ALEN) != 0);
   assert(memcmp(&entry->mac_addr, &zero_mac, ETH_ALEN) != 0);
 
@@ -757,7 +765,7 @@ static void arp_age_entry(struct arp_cache_entry *entry) {
     }
     memset(entry, 0, sizeof *entry);
     assert(entry->state == ARP_STATE_UNUSED);
-    assert(is_this_host_ip_address(entry->ip_addr));
+    assert(ip_is_this_host(entry->ip_addr));
     return;
   }
 

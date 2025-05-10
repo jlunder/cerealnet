@@ -76,6 +76,7 @@ void ser_read_available(void) {
       // too many outbound packets queued?
       return;
     }
+    memset(&ser_read_accum->hdr, 0, sizeof ser_read_accum->hdr);
   }
 
   do {
@@ -191,8 +192,13 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
   ser_read_accum_esc = esc;
 }
 
-void ser_send(struct eth_packet *frame) {
+bool ser_send(struct eth_packet *frame) {
   assert(frame != NULL);
+
+  if (ser_write_buf_tail != 0) {
+    return false;
+  }
+
   struct ip_packet *ip_frame = &frame->ip;
   assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(frame)));
 
@@ -258,6 +264,8 @@ void ser_send(struct eth_packet *frame) {
   // logf("SLIP encoded:\n");
   // hex_dump(stdlog, ser_write_buf, j);
   ser_try_write_all_queued();
+
+  return true;
 }
 
 bool ser_has_work(void) {

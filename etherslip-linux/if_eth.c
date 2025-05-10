@@ -122,32 +122,27 @@ void eth_read_available(void) {
   }
 }
 
-void eth_send(struct eth_packet *frame) {
+bool eth_send(struct eth_packet *frame) {
   assert(frame != NULL);
-  struct ip_packet *ip_frame = &frame->ip;
+
+  if (eth_write_queue != NULL) {
+    return false;
+  }
+
   assert(validate_eth_ip_frame(frame));
 
   if (!client_ready) {
     // We need a MAC address to send, but if we're not ready it's uninitialized
     if (verbose_log) {
-      logf("client sending while not ready, dropping packet\n");
+      logf("eth: client sending while not ready, dropping packet\n");
     }
-    return;
+    free_packet_buf(frame);
+    return true;
   }
 
-  if (very_verbose_log && send_log) {
-    logf("eth_send packet:\n");
-    hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
-  }
-
-  if (eth_write_queue != NULL) {
-    if (verbose_log) {
-      logf("eth_send last queued packet dropped\n");
-    }
-    free_packet_buf(eth_write_queue);
-  }
   eth_write_queue = frame;
   eth_try_write_all_queued();
+  return true;
 }
 
 bool eth_has_work(void) { return eth_write_queue != NULL; }
@@ -172,9 +167,9 @@ void eth_try_write_all_queued(void) {
         ether_ntoa((struct ether_addr const *)&eth_write_queue->hdr.h_dest),
         (unsigned long)ntohs(eth_write_queue->ip.hdr.tot_len),
         (int)eth_write_queue->ip.hdr.protocol,
-        inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.saddr));
-    logf("da=%s\n",
-         inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.daddr));
+        inet_ntoa(ip_get_saddr(&eth_write_queue->ip)));
+    logf("da=%s\n", inet_ntoa(ip_get_daddr(&eth_write_queue->ip)));
+    hex_dump(stdlog, eth_write_queue->eth_raw, eth_write_queue->recv_size);
   }
   res = sendto(eth_socket, eth_write_queue, eth_write_queue->recv_size,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);

@@ -79,8 +79,13 @@ void pkt_read_available(void) {
   }
 }
 
-void pkt_send(struct eth_packet *frame) {
+bool pkt_send(struct eth_packet *frame) {
   assert(frame != NULL);
+
+  if (pkt_write_queue != NULL) {
+    return false;
+  }
+
   struct ip_packet *ip_frame = &frame->ip;
   assert(validate_ip_frame(ip_frame, ETH_IP_SIZE(frame)));
 
@@ -89,12 +94,6 @@ void pkt_send(struct eth_packet *frame) {
     hex_dump(stdlog, &frame->ip, ntohs(frame->ip.hdr.tot_len));
   }
 
-  if (pkt_write_queue != NULL) {
-    if (verbose_log) {
-      logf("pkt_send last queued packet dropped\n");
-    }
-    free_packet_buf(pkt_write_queue);
-  }
   pkt_write_queue = frame;
   pkt_try_write_all_queued();
 }
@@ -121,9 +120,8 @@ void pkt_try_write_all_queued(void) {
         ether_ntoa((struct ether_addr const *)&pkt_write_queue->hdr.h_dest),
         (unsigned long)ntohs(pkt_write_queue->ip.hdr.tot_len),
         (int)pkt_write_queue->ip.hdr.protocol,
-        inet_ntoa(*(struct in_addr *)&pkt_write_queue->ip.hdr.saddr));
-    logf("da=%s\n",
-         inet_ntoa(*(struct in_addr *)&pkt_write_queue->ip.hdr.daddr));
+        inet_ntoa(ip_get_saddr(&pkt_write_queue->ip)));
+    logf("da=%s\n", inet_ntoa(ip_get_daddr(&pkt_write_queue->ip)));
   }
   res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->recv_size,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);

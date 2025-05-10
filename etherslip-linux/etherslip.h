@@ -73,9 +73,13 @@
 
 #define logf(...) fprintf(stdlog, __VA_ARGS__)
 
+#define IS_POW2(x) (((x - 1) | ((x - 1) >> 1)) == (x - 1))
+
 // big enough for a 9k jumbo frame
 #define MAX_PACKET_SIZE (1024 * 10 - sizeof(size_t))
 #define PACKET_POOL_SIZE 8
+
+static_assert(IS_POW2(PACKET_POOL_SIZE));
 
 #define SER_IDX 0
 #if USE_IF_ETH
@@ -92,6 +96,26 @@
 #define SLIP_ESC 0333     /* indicates byte stuffing */
 #define SLIP_ESC_END 0334 /* ESC ESC_END means END data byte */
 #define SLIP_ESC_ESC 0335 /* ESC ESC_ESC means ESC data byte */
+
+// clang-format off
+
+// NOTES ABOUT ENDIANNESS
+
+// Seems that endianness is a bit of a mess in ye olde Unix network headers!
+// Here's our policy:
+// - Things in packet structs are always in network order
+// - Things outside packet structs (so in local variables, or in internal
+//   structs like the arp_cache_entry or dhcp_info or whatever) are always in
+//   host order
+// - Except for MAC addresses which are always ALWAYS in network order
+// - AND except for any "struct in_addr" which is ALSO always in network order
+// - BUT NOT IPv4 addresses that are locals or constants in in_addr_t or
+//   uint32_t variables, which are again in host order!
+// - BUT also because that's SUPER confusing, it's additionally policy that IPv4
+//   addresses should ALWAYS be in "struct in_addr" when passed as parameters or
+//   stored in locals
+
+// clang-format on
 
 struct dhcp_msg {
   uint8_t op;
@@ -154,8 +178,6 @@ typedef uint32_t time_ms_t;
 
 #define ETH_IP_SIZE(frame) (frame->recv_size - sizeof(struct ethhdr))
 
-static struct in_addr const this_host_ip_address = {0x00000000};
-
 extern bool recv_log;
 extern bool send_log;
 extern bool verbose_log;
@@ -174,6 +196,11 @@ extern struct ether_addr const broadcast_mac;
 extern struct ether_addr const zero_mac;
 
 extern struct in_addr client_ip;
+extern struct in_addr client_network;
+extern struct in_addr client_netmask;
+extern struct in_addr client_broadcast;
+extern struct in_addr client_gateway;
+static struct in_addr const this_host_ip = {INADDR_ANY};
 
 extern struct eth_packet packet_pool[PACKET_POOL_SIZE];
 extern struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
@@ -216,9 +243,10 @@ void net_process_frame(struct eth_packet *frame);
 bool net_forward_client_frame(struct eth_packet *frame);
 
 // Send a link-level frame via eth or pkt (used by client, arp)
-void net_send_link_frame(struct eth_packet *frame);
+bool net_send_link_frame(struct eth_packet *frame);
 
-bool net_has_work(void);
+void net_process_queued(void);
+
 bool net_waiting(void);
 
 bool arp_process_frame(struct eth_packet *frame);
@@ -233,14 +261,13 @@ void arp_merge_entry(struct ether_addr merge_mac, struct in_addr merge_ip);
 void arp_send_announce(struct ether_addr announce_mac,
                        struct in_addr announce_ip);
 
-bool arp_has_work(void);
-void arp_process_queued(void);
 void arp_idle(void);
 
 // bool dhcp_snoop_request(struct eth_packet *frame);
 // bool dhcp_snoop_response(struct eth_packet *frame);
 
-bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info);
+struct dhcp_msg *dhcp_parse_packet(struct eth_packet *frame,
+                                   struct dhcp_info *out_info);
 
 bool dhcp_parse_options(uint8_t const *opts, size_t len,
                         struct dhcp_info *out_info);
@@ -249,7 +276,7 @@ void ser_init(char const *ser_dev_name);
 void ser_setup_pollfd(struct pollfd *pfd);
 void ser_read_available(void);
 void ser_accumulate_bytes(uint8_t *data, size_t size);
-void ser_send(struct eth_packet *frame);
+bool ser_send(struct eth_packet *frame);
 bool ser_has_work(void);
 void ser_try_write_all_queued(void);
 
@@ -257,7 +284,7 @@ void ser_try_write_all_queued(void);
 void eth_init(char const *eth_dev_name);
 void eth_setup_pollfd(struct pollfd *pfd);
 void eth_read_available(void);
-void eth_send(struct eth_packet *frame);
+bool eth_send(struct eth_packet *frame);
 bool eth_has_work(void);
 void eth_try_write_all_queued(void);
 #endif
@@ -266,17 +293,50 @@ void eth_try_write_all_queued(void);
 void pkt_init(void);
 void pkt_setup_pollfd(struct pollfd *pfd);
 void pkt_read_available(void);
-void pkt_send(struct eth_packet *frame);
+bool pkt_send(struct eth_packet *frame);
 bool pkt_has_work(void);
 void pkt_try_write_all_queued(void);
 #endif
+
+static inline struct in_addr ip_get_daddr(struct ip_packet const *ip_frame) {
+  struct in_addr result = {ntohl(ip_frame->hdr.daddr)};
+  return result;
+}
+
+static inline void ip_set_daddr(struct ip_packet *ip_frame,
+                                struct in_addr daddr) {
+  ip_frame->hdr.daddr = htonl(daddr.s_addr);
+}
+
+static inline struct in_addr ip_get_saddr(struct ip_packet const *ip_frame) {
+  struct in_addr result = {ntohl(ip_frame->hdr.saddr)};
+  return result;
+}
+
+static inline void ip_set_saddr(struct ip_packet *ip_frame,
+                                struct in_addr saddr) {
+  ip_frame->hdr.saddr = htonl(saddr.s_addr);
+}
 
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size);
 bool validate_eth_ip_frame(struct eth_packet const *frame);
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size);
 
-static inline bool is_proper_ip_address(struct in_addr ip_addr) {
+static inline bool eth_is_proper_mac(struct ether_addr mac_addr) {
+  return (memcmp(&mac_addr, &zero_mac, ETH_ALEN) != 0) &&
+         (memcmp(&mac_addr, &broadcast_mac, ETH_ALEN) != 0);
+}
+
+static inline bool ip_equals(struct in_addr a, struct in_addr b) {
+  return a.s_addr == b.s_addr;
+}
+
+static inline bool ip_is_broadcast(struct in_addr ip_addr) {
+  return ip_addr.s_addr == htonl(INADDR_BROADCAST);
+}
+
+static inline bool ip_is_proper_or_broadcast(struct in_addr ip_addr) {
   // Reserved addresses! But especially ones that should not be picked up as if
   // they were real host addresses. Note this doesn't include the net-local
   // broadcast or "zero" address, because you need to know the network/netmask
@@ -287,30 +347,21 @@ static inline bool is_proper_ip_address(struct in_addr ip_addr) {
   // 169.254.0.0/16: link-local
   // 255.255.255.255/32: broadcast
   // clang-format on
-  uint32_t addr = ntohl(ip_addr.s_addr);
-  return ((addr & 0xFF000000UL) != 0x00000000UL) &&
-         ((addr & 0xFF000000UL) != 0x7F000000UL) &&
-         ((addr & 0xFFC00000UL) != 0x64400000UL) &&
-         ((addr & 0xFFFF0000UL) != 0xA9FE0000UL) && (addr != 0xFFFFFFFFUL);
+  uint32_t addr = ip_addr.s_addr;
+  return ((addr & htonl(0xFF000000UL)) != htonl(0x00000000UL)) &&
+         ((addr & htonl(0xFF000000UL)) != htonl(0x7F000000UL)) &&
+         ((addr & htonl(0xFFC00000UL)) != htonl(0x64400000UL)) &&
+         ((addr & htonl(0xFFFF0000UL)) != htonl(0xA9FE0000UL));
 }
 
-static inline bool is_local_ip_address(struct in_addr ip_addr,
-                                       struct in_addr net_addr,
-                                       struct in_addr net_mask) {
-  assert((net_addr.s_addr & ~net_mask.s_addr) == 0);
-  return (ip_addr.s_addr & net_mask.s_addr) == net_addr.s_addr;
+static inline bool ip_is_proper(struct in_addr ip_addr) {
+  return !ip_is_broadcast(ip_addr) && ip_is_proper_or_broadcast(ip_addr);
 }
 
-// "this net" is for devices in the process of figuring out what network they're
-// on (e.g. DHCP)
-static inline bool is_this_net_ip_address(struct in_addr ip_addr) {
-  return (ntohl(ip_addr.s_addr) & 0xFF000000UL) == 0x00000000UL;
-}
-
-// "this net" is for devices in the process of figuring out what their own IP
+// "this host" is for devices in the process of figuring out what their own IP
 // address is (e.g. DHCP)
-static inline bool is_this_host_ip_address(struct in_addr ip_addr) {
-  return ntohl(ip_addr.s_addr) == 0x00000000UL;
+static inline bool ip_is_this_host(struct in_addr ip_addr) {
+  return ntohl(ip_addr.s_addr) == INADDR_ANY;
 }
 
 struct eth_packet *alloc_packet_buf(void);

@@ -2,6 +2,13 @@
 
 #define NET_FORWARD_QUEUE_SIZE 2
 
+static_assert(IS_POW2(NET_FORWARD_QUEUE_SIZE));
+
+struct net_forward_queue_entry {
+  struct eth_packet *frame;
+  time_ms_t submitted_ms;
+};
+
 bool recv_log = false;
 bool send_log = false;
 bool verbose_log = false;
@@ -18,15 +25,19 @@ struct ether_addr host_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr const broadcast_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
 struct ether_addr const zero_mac = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
-struct in_addr client_ip = {0};
+struct in_addr client_ip = {INADDR_ANY};
+struct in_addr client_network = {INADDR_ANY};
+struct in_addr client_netmask = {INADDR_ANY};
+struct in_addr client_broadcast = {INADDR_BROADCAST};
+struct in_addr client_gateway = {INADDR_BROADCAST};
 
 struct eth_packet packet_pool[PACKET_POOL_SIZE];
 struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 size_t packet_pool_unallocated_count = 0;
 
-struct eth_packet *net_forward_queue[NET_FORWARD_QUEUE_SIZE];
-size_t net_forward_queue_count = 0;
+struct net_forward_queue_entry net_forward_queue[NET_FORWARD_QUEUE_SIZE];
 size_t net_forward_queue_tail = 0;
+size_t net_forward_queue_count = 0;
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
@@ -187,7 +198,7 @@ void poll_loop(void) {
 
   for (;;) {
     int poll_timeout = 100;
-    if (ser_has_work() || net_has_work()
+    if (ser_has_work()
 #if USE_IF_ETH
         || eth_has_work()
 #elif USE_IF_PKT
@@ -195,7 +206,7 @@ void poll_loop(void) {
 #else
 #error "Must specify an interface type"
 #endif
-        || arp_has_work()) {
+    ) {
       poll_timeout = 0;
     } else if (net_waiting()) {
       poll_timeout = 1;
@@ -260,7 +271,8 @@ void poll_loop(void) {
 #error "Must specify an interface type"
 #endif
 
-      arp_process_queued();
+      // Process/send packets waiting on ARP replies etc.
+      net_process_queued();
 
       // Do any queued writes resulting from the reads
       ser_try_write_all_queued();
@@ -320,9 +332,8 @@ bool client_forward_net_frame(struct eth_packet *frame) {
         "sa=%s, ",
         (unsigned long)frame->recv_size,
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
-        (int)frame->ip.hdr.protocol,
-        inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
-    logf("da=%s\n", inet_ntoa(*(struct in_addr *)&frame->ip.hdr.daddr));
+        (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
+    logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
   }
 
   // TODO rewrite IP addresses for masquerading if needed
@@ -391,33 +402,72 @@ bool net_forward_client_frame(struct eth_packet *frame) {
         "sa=%s, ",
         (unsigned long)ETH_IP_SIZE(frame),
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
-        (int)frame->ip.hdr.protocol,
-        inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
-    logf("da=%s\n", inet_ntoa(*(struct in_addr *)&frame->ip.hdr.daddr));
+        (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
+    logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
     hex_dump(stdlog, frame->eth_raw, frame->recv_size);
   }
 
   assert(validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame)));
+
+  if (!ip_is_proper(client_ip) && ip_is_proper(ip_get_saddr(&frame->ip))) {
+    if (verbose_log) {
+      logf("net: updating client IP from %s", inet_ntoa(client_ip));
+      logf(" to %s (snooped outgoing)\n",
+           inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
+    }
+    client_ip = *(struct in_addr *)&frame->ip.hdr.saddr;
+  }
 
   if (frame->ip.hdr.protocol == IPPROTO_UDP) {
     struct iphdr *ip = &frame->ip.hdr;
     size_t header_len = ip->ihl * 4;
     if (header_len + sizeof(struct udphdr) > ntohs(ip->tot_len)) {
       // Not well formed
-      logf("net: runt UDP datagram from client\n");
+      if (verbose_log) {
+        logf("net: runt UDP datagram from client, not forwarding\n");
+      }
       return false;
     }
     struct udphdr *udp = (struct udphdr *)&frame->ip.ip_raw[header_len];
     if (header_len + ntohs(udp->len) != ntohs(ip->tot_len)) {
       // Not well formed
-      logf("net: UDP length %d does not match IP length %d\n",
-           (int)(header_len + ntohs(udp->len)), (int)ntohs(ip->tot_len));
+      if (verbose_log) {
+        logf("net: UDP length %d does not match IP length %d, not forwarding\n",
+             (int)(header_len + ntohs(udp->len)), (int)ntohs(ip->tot_len));
+      }
       return false;
     }
-    logf("net: snooping possible DHCP packet\n");
-    // Snoop DHCP
+
+    // Snoop/masquerade DHCP
     struct dhcp_info info;
-    if (dhcp_parse_packet(frame, &info)) {
+    struct dhcp_msg *dhcp = dhcp_parse_packet(frame, &info);
+    if (dhcp != NULL) {
+      if (!client_ready &&
+          (info.client_to_broadcast || info.client_to_server)) {
+        if (eth_is_proper_mac(*(struct ether_addr *)&dhcp->chaddr)) {
+          logf("net: adopting client MAC %s from BOOTP/DHCP request\n",
+               ether_ntoa((struct ether_addr *)&dhcp->chaddr));
+          memcpy(&client_mac, &dhcp->chaddr, ETH_ALEN);
+          client_ready = true;
+        }
+        if (ip_is_proper(*(struct in_addr *)&dhcp->ciaddr)) {
+          logf("net: adopting initial client IP %s from BOOTP/DHCP request\n",
+               inet_ntoa(dhcp->ciaddr));
+          client_ip = dhcp->ciaddr;
+        }
+      }
+
+      if (verbose_log && !ip_equals(client_ip, dhcp->ciaddr)) {
+        logf("net: client supplied suspicious ciaddr %s",
+             inet_ntoa(dhcp->ciaddr));
+        logf("in snooped DHCP, expected %s\n", inet_ntoa(client_ip));
+      }
+
+      // Rewrite client MAC address in packet
+      memcpy(&dhcp->chaddr, &client_mac, ETH_ALEN);
+
+      // re-parse
+      dhcp = dhcp_parse_packet(frame, &info);
       logf("net: snooping client DHCP");
       logf(" from %s@%s", inet_ntoa(info.client_ip),
            ether_ntoa(&info.client_mac));
@@ -445,37 +495,104 @@ bool net_forward_client_frame(struct eth_packet *frame) {
         logf(" ACK");
       }
       logf("\n");
-    } else {
-      logf("net: doesn't seem to be valid BOOTP/DHCP\n");
     }
   }
 
-  if (client_ready) {
-    frame->hdr.h_proto = htons(ETH_P_IP);
-    *(struct ether_addr *)&frame->hdr.h_source = client_mac;
+  struct in_addr dest_ip = ip_get_daddr(&frame->ip);
+  if (!ip_is_proper_or_broadcast(dest_ip)) {
+    if (verbose_log) {
+      logf("net: client packet with improper destination %s, not forwarding\n",
+           inet_ntoa(dest_ip));
+    }
+    return false;
+  }
 
-    if (net_forward_queue_count >= NET_FORWARD_QUEUE_SIZE) {
-      if (verbose_log) {
-        logf("net: send queue full, dropping packet\n");
-      }
+  // This should have been reset, it's actually critical in order for the ARP
+  // request to be checked/retried later
+  assert(memcmp(&frame->hdr.h_dest, &zero_mac, ETH_ALEN) == 0);
+
+  // Try to get the last bit, dest MAC, and send immediately
+  if (client_ready &&
+      arp_fetch_address(client_ip, dest_ip, true,
+                        (struct ether_addr *)&frame->hdr.h_dest)) {
+    if (net_send_link_frame(frame)) {
       return true;
     }
   }
 
-  return false;
+  // Find an open spot in the send queue
+  for (size_t i = 0; i < NET_FORWARD_QUEUE_SIZE; ++i) {
+    if (net_forward_queue[net_forward_queue_tail].frame == NULL) {
+      break;
+    }
+    net_forward_queue_tail =
+        (net_forward_queue_tail + 1) & (NET_FORWARD_QUEUE_SIZE - 1);
+  }
+
+  if (net_forward_queue[net_forward_queue_tail].frame != NULL) {
+    if (verbose_log) {
+      logf("net: forward queue full, not forwarding\n");
+    }
+    return false;
+  }
+
+  net_forward_queue[net_forward_queue_tail].frame = frame;
+  net_forward_queue[net_forward_queue_tail].submitted_ms = now_ms;
+  ++net_forward_queue_count;
+
+  return true;
 }
 
-void net_send_link_frame(struct eth_packet *frame) {
+bool net_send_link_frame(struct eth_packet *frame) {
 #if USE_IF_ETH
-  eth_send(frame);
+  // Fill out info we definitely have
+  frame->hdr.h_proto = htons(ETH_P_IP);
+  *(struct ether_addr *)&frame->hdr.h_source = client_mac;
+
+  return eth_send(frame);
 #elif USE_IF_PKT
-  pkt_send(frame);
+  return pkt_send(frame);
 #else
 #error "Must specify an interface type"
 #endif
 }
 
-bool net_has_work(void) { return false; }
+void net_process_queued(void) {
+  net_forward_queue_count = 0;
+
+  for (size_t i = 0; i < NET_FORWARD_QUEUE_SIZE; ++i) {
+    struct net_forward_queue_entry *entry =
+        &net_forward_queue[(net_forward_queue_tail + i) &
+                           (NET_FORWARD_QUEUE_SIZE - 1)];
+    if (entry->frame == NULL) {
+      continue;
+    }
+
+    if (time_since_ms(now_ms, entry->submitted_ms) > 5000UL) {
+      // Aged out
+      free_packet_buf(entry->frame);
+      entry->frame = NULL;
+      continue;
+    }
+
+    bool has_h_dest =
+        (memcmp(&entry->frame->hdr.h_dest, &zero_mac, ETH_ALEN) != 0);
+    if (!has_h_dest) {
+      // No destination MAC yet, retry ARP
+      has_h_dest =
+          arp_fetch_address(client_ip, ip_get_daddr(&entry->frame->ip), true,
+                            (struct ether_addr *)&entry->frame->hdr.h_dest);
+    }
+    if (has_h_dest && net_send_link_frame(entry->frame)) {
+      // Successfully sent!
+      entry->frame = NULL;
+    }
+
+    if (entry->frame != NULL) {
+      ++net_forward_queue_count;
+    }
+  }
+}
 
 bool net_waiting(void) { return net_forward_queue_count > 0; }
 
@@ -493,7 +610,8 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
   return ~checksum & 0xFFFF;
 }
 
-bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info) {
+struct dhcp_msg *dhcp_parse_packet(struct eth_packet *frame,
+                                   struct dhcp_info *out_info) {
   assert(out_info != NULL);
 
   struct iphdr *ip = &frame->ip.hdr;
@@ -517,15 +635,15 @@ bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info) {
       out_info->client_to_server = true;
     }
     memcpy(&out_info->client_mac, &frame->hdr.h_source, ETH_ALEN);
-    memcpy(&out_info->client_ip, &ip->saddr, sizeof(struct in_addr));
+    out_info->client_ip = ip_get_saddr(&frame->ip);
     memcpy(&out_info->server_mac, &frame->hdr.h_dest, ETH_ALEN);
-    memcpy(&out_info->server_ip, &ip->daddr, sizeof(struct in_addr));
+    out_info->server_ip = ip_get_daddr(&frame->ip);
   } else if ((udp->source == 67) && (udp->dest == 68)) {
     out_info->server_to_client = true;
     memcpy(&out_info->client_mac, &frame->hdr.h_dest, ETH_ALEN);
-    memcpy(&out_info->client_ip, &ip->daddr, sizeof(struct in_addr));
+    out_info->client_ip = ip_get_daddr(&frame->ip);
     memcpy(&out_info->server_mac, &frame->hdr.h_source, ETH_ALEN);
-    memcpy(&out_info->server_ip, &ip->saddr, sizeof(struct in_addr));
+    out_info->server_ip = ip_get_saddr(&frame->ip);
   } else {
     // Probably not BOOTP/DHCP at all
     if (very_verbose_log) {
@@ -533,14 +651,14 @@ bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info) {
            (unsigned short)ntohs(udp->source),
            (unsigned short)ntohs(udp->dest));
     }
-    return false;
+    return NULL;
   }
 
   if (ntohs(udp->len) < offsetof(struct dhcp_msg, options) + 4) {
     if (verbose_log) {
       logf("dhcp_parse: truncated datagram, %d\n", (int)ntohs(udp->len));
     }
-    return false;
+    return NULL;
   }
 
   struct dhcp_msg *dhcp =
@@ -551,14 +669,14 @@ bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info) {
       logf("dhcp_parse: invalid htype/hlen %d/%d\n", (int)dhcp->htype,
            (int)dhcp->hlen);
     }
-    return false;
+    return NULL;
   }
   if (ntohl(*(uint32_t *)dhcp->options) != 0x63825363) {
     if (verbose_log) {
       logf("dhcp_parse: invalid options magic %08lX\n",
            (unsigned long)*(uint32_t *)dhcp->options);
     }
-    return false;
+    return NULL;
   }
 
   memcpy(&out_info->chaddr, &dhcp->chaddr, ETH_ALEN);
@@ -571,25 +689,25 @@ bool dhcp_parse_packet(struct eth_packet *frame, struct dhcp_info *out_info) {
     if (verbose_log) {
       logf("dhcp_parse: invalid bootp op %d\n", (int)dhcp->op);
     }
-    return false;
+    return NULL;
   }
 
   uint8_t *opts_end = &frame->ip.ip_raw[ntohs(ip->tot_len)];
   if (!dhcp_parse_options(dhcp->options + 4, opts_end - (dhcp->options + 4),
                           out_info)) {
-    return false;
+    return NULL;
   }
   if (out_info->options_in_file) {
     if (!dhcp_parse_options(dhcp->file, sizeof dhcp->file, out_info)) {
-      return false;
+      return NULL;
     }
   }
   if (out_info->options_in_sname) {
     if (!dhcp_parse_options(dhcp->sname, sizeof dhcp->sname, out_info)) {
-      return false;
+      return NULL;
     }
   }
-  return true;
+  return dhcp;
 }
 
 bool dhcp_parse_options(uint8_t const *opts, size_t len,

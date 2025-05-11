@@ -112,19 +112,19 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
     // If the last character was ESC, apply special processing to this one
     if (esc) {
       uint8_t c = data[i++];
-      assert(used < sizeof ser_read_accum->ip.ip_raw);
+      assert(used < sizeof ser_read_accum->ip.raw);
       switch (c) {
         case SLIP_ESC_END: {
-          ser_read_accum->ip.ip_raw[used++] = SLIP_END;
+          ser_read_accum->ip.raw[used++] = SLIP_END;
         } break;
         case SLIP_ESC_ESC: {
-          ser_read_accum->ip.ip_raw[used++] = SLIP_ESC;
+          ser_read_accum->ip.raw[used++] = SLIP_ESC;
         } break;
         // If "c" is not one of these two, then we have a protocol violation.
         // The best bet seems to be to leave the byte alone and just stuff it
         // into the packet.
         default: {
-          ser_read_accum->ip.ip_raw[used++] = c;
+          ser_read_accum->ip.raw[used++] = c;
         } break;
       }
       esc = false;
@@ -142,9 +142,9 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
     // Any found?
     if (j > i) {
       size_t amount = j - i;
-      assert(used + amount <= sizeof ser_read_accum->ip.ip_raw);
+      assert(used + amount <= sizeof ser_read_accum->ip.raw);
       // Copy the entire block of non-special bytes at once
-      memcpy(ser_read_accum->ip.ip_raw + used, data + i, amount);
+      memcpy(ser_read_accum->ip.raw + used, data + i, amount);
       used += amount;
       i = j;
       // Stop if we've emptied the input buffer
@@ -216,7 +216,7 @@ bool ser_send(struct eth_packet *frame) {
   // accumulated in the receiver due to line noise
   ser_write_buf[j++] = SLIP_END;
   while (i < size) {
-    uint8_t c = ip_frame->ip_raw[i];
+    uint8_t c = ip_frame->raw[i];
     switch (c) {
       // If it's the same code as an END character, we send a special two
       // character code so as not to make the receiver think we sent an END
@@ -241,13 +241,13 @@ bool ser_send(struct eth_packet *frame) {
         size_t k = i + 1;
         // But also keep looking in case more regular characters can be sent all
         // at once
-        while ((k < size) && (ip_frame->ip_raw[k] != SLIP_END) &&
-               (ip_frame->ip_raw[k] != SLIP_ESC)) {
+        while ((k < size) && (ip_frame->raw[k] != SLIP_END) &&
+               (ip_frame->raw[k] != SLIP_ESC)) {
           ++k;
         }
         size_t amount = k - i;
         assert(j + amount <= SER_WRITE_QUEUE_SIZE);
-        memcpy(ser_write_buf + j, ip_frame->ip_raw + i, amount);
+        memcpy(ser_write_buf + j, ip_frame->raw + i, amount);
         i = k;
         j += amount;
       } break;

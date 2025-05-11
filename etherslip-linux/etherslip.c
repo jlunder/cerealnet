@@ -4,10 +4,20 @@
 
 static_assert(IS_POW2(NET_FORWARD_QUEUE_SIZE));
 
+struct udp_pseudoip {
+  struct in_addr saddr;
+  struct in_addr daddr;
+  uint8_t pad;
+  uint8_t protocol;
+  uint16_t udplen;
+} __attribute__((packed));
+
 struct net_forward_queue_entry {
   struct eth_packet *frame;
   time_ms_t submitted_ms;
 };
+
+uint16_t udp_checksum(struct ip_packet const *ip_frame, size_t udp_size);
 
 bool recv_log = false;
 bool send_log = false;
@@ -299,8 +309,7 @@ void client_process_frame(struct eth_packet *frame) {
   if (frame->len < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
     if (verbose_log && send_log) {
-      logf("client packet runt frame (%lu bytes)\n",
-           (unsigned long)frame->len);
+      logf("client packet runt frame (%lu bytes)\n", (unsigned long)frame->len);
     }
   } else
     // validate_ip_frame not validate_eth_ip_frame, because the ethernet frame
@@ -310,7 +319,7 @@ void client_process_frame(struct eth_packet *frame) {
       if (verbose_log && send_log) {
         logf("client packet not valid (%lu bytes):\n",
              (unsigned long)ETH_IP_SIZE(frame));
-        hex_dump(stdlog, frame->ip.ip_raw, ETH_IP_SIZE(frame));
+        hex_dump(stdlog, frame->ip.raw, ETH_IP_SIZE(frame));
       }
     } else if (net_forward_client_frame(frame)) {
       frame = NULL;
@@ -330,8 +339,7 @@ bool client_forward_net_frame(struct eth_packet *frame) {
     logf(
         "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
         "sa=%s, ",
-        (unsigned long)frame->len,
-        (unsigned long)ntohs(frame->ip.hdr.tot_len),
+        (unsigned long)frame->len, (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
   }
@@ -348,8 +356,7 @@ void net_process_frame(struct eth_packet *frame) {
   if (frame->len < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
     if (verbose_log && recv_log) {
-      logf("net packet runt frame (%lu bytes)\n",
-           (unsigned long)frame->len);
+      logf("net packet runt frame (%lu bytes)\n", (unsigned long)frame->len);
     }
   } else if (frame->len > MAX_PACKET_SIZE) {
     // Ignore packet, too big (extra jumbo frame? We can't handle it)
@@ -385,7 +392,7 @@ void net_process_frame(struct eth_packet *frame) {
           (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0)) {
         logf("net packet not recognized (%lu bytes):\n",
              (unsigned long)frame->len);
-        hex_dump(stdlog, &frame->eth_raw, frame->len);
+        hex_dump(stdlog, &frame->raw, frame->len);
       }
     }
   }
@@ -404,7 +411,7 @@ bool net_forward_client_frame(struct eth_packet *frame) {
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
-    hex_dump(stdlog, frame->eth_raw, frame->len);
+    hex_dump(stdlog, frame->raw, frame->len);
   }
 
   assert(validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame)));
@@ -428,14 +435,27 @@ bool net_forward_client_frame(struct eth_packet *frame) {
       }
       return false;
     }
-    struct udphdr *udp = (struct udphdr *)&frame->ip.ip_raw[header_len];
-    if (header_len + ntohs(udp->len) != ntohs(ip->tot_len)) {
+    struct udphdr *udp = (struct udphdr *)&frame->ip.raw[header_len];
+    size_t req_tot_len = header_len + ntohs(udp->len);
+    if (req_tot_len > ntohs(ip->tot_len)) {
       // Not well formed
       if (verbose_log) {
         logf("net: UDP length %d does not match IP length %d, not forwarding\n",
              (int)(header_len + ntohs(udp->len)), (int)ntohs(ip->tot_len));
       }
       return false;
+    }
+    if (udp->check != 0) {
+      uint16_t check = udp_checksum(&frame->ip, ntohs(udp->len));
+      if (check != 0xFFFF) {
+        if (verbose_log) {
+          logf(
+              "net: UDP checksum 0x%04X does not match computed 0x%04X, not "
+              "forwarding\n",
+              (unsigned)udp->check, (unsigned)check);
+        }
+        return false;
+      }
     }
 
     // Snoop/masquerade DHCP
@@ -465,6 +485,8 @@ bool net_forward_client_frame(struct eth_packet *frame) {
 
       // Rewrite client MAC address in packet
       memcpy(&dhcp->chaddr, &client_mac, ETH_ALEN);
+      udp->check = htons(0);
+      udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
 
       // re-parse
       dhcp = dhcp_parse_packet(frame, &info);
@@ -610,13 +632,50 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
   return ~checksum & 0xFFFF;
 }
 
+uint16_t udp_checksum(struct ip_packet const *ip_frame, size_t udp_size) {
+  struct udp_pseudoip pseudo_ip;
+  pseudo_ip.saddr = ip_get_saddr(ip_frame);
+  pseudo_ip.daddr = ip_get_daddr(ip_frame);
+  pseudo_ip.pad = 0;
+  pseudo_ip.protocol = IPPROTO_UDP;
+  pseudo_ip.udplen = htons(udp_size);
+
+  assert(udp_size < 65535);
+  // This checksum can't overflow a uint32 for a valid-sized UDP packet, but the
+  // size restriction imposed by UDP is critical. At max packet size of 64k, we
+  // will sum to 32768 * 65535, which is getting close to INT32_MAX
+  uint32_t checksum = 0;
+
+  // Checksum the pseudo-IP header
+  for (size_t i = 0; i < sizeof(pseudo_ip) / 2; ++i) {
+    checksum += ntohs(((uint16_t const *)&pseudo_ip)[i]);
+  }
+  // Checksum the datagram
+  for (size_t i = 0; i < udp_size / 2; ++i) {
+    checksum += ntohs(((uint16_t const *)(ip_frame->raw + ip_frame->hdr.ihl * 4))[i]);
+  }
+  // For odd size, add in an implicitly padded last word
+  if ((udp_size & 1) != 0) {
+    checksum += ntohs((ip_frame->raw + ip_frame->hdr.ihl * 4)[udp_size - 1]);
+  }
+
+  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
+  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
+  assert(checksum <= 0xFFFF);
+  checksum = ~checksum & 0xFFFF;
+  if (checksum == 0) {
+    checksum = 0xFFFF;
+  }
+  return htons(checksum);
+}
+
 struct dhcp_msg *dhcp_parse_packet(struct eth_packet *frame,
                                    struct dhcp_info *out_info) {
   assert(out_info != NULL);
 
   struct iphdr *ip = &frame->ip.hdr;
   size_t header_len = ip->ihl * 4;
-  struct udphdr *udp = (struct udphdr *)&frame->ip.ip_raw[header_len];
+  struct udphdr *udp = (struct udphdr *)&frame->ip.raw[header_len];
 
   // These should already have been checked -- is it valid UDP?
   assert(frame->ip.hdr.protocol == IPPROTO_UDP);
@@ -662,7 +721,7 @@ struct dhcp_msg *dhcp_parse_packet(struct eth_packet *frame,
   }
 
   struct dhcp_msg *dhcp =
-      (struct dhcp_msg *)&frame->ip.ip_raw[header_len + sizeof(struct udphdr)];
+      (struct dhcp_msg *)&frame->ip.raw[header_len + sizeof(struct udphdr)];
 
   if ((dhcp->htype != ARPHRD_ETHER) || (dhcp->hlen != ETH_ALEN)) {
     if (verbose_log) {
@@ -692,7 +751,7 @@ struct dhcp_msg *dhcp_parse_packet(struct eth_packet *frame,
     return NULL;
   }
 
-  uint8_t *opts_end = &frame->ip.ip_raw[ntohs(ip->tot_len)];
+  uint8_t *opts_end = &frame->ip.raw[ntohs(ip->tot_len)];
   if (!dhcp_parse_options(dhcp->options + 4, opts_end - (dhcp->options + 4),
                           out_info)) {
     return NULL;

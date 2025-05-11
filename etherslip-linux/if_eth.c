@@ -114,7 +114,7 @@ void eth_read_available(void) {
 
   ssize_t recv_size;
 
-  assert(sizeof frame->eth_raw == MAX_PACKET_SIZE);
+  assert(sizeof frame->raw == MAX_PACKET_SIZE);
   recv_size =
       recvfrom(eth_socket, frame, MAX_PACKET_SIZE, MSG_DONTWAIT, NULL, NULL);
   if (recv_size < 0) {
@@ -176,7 +176,7 @@ void eth_try_write_all_queued(void) {
         (int)eth_write_queue->ip.hdr.protocol,
         inet_ntoa(ip_get_saddr(&eth_write_queue->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&eth_write_queue->ip)));
-    hex_dump(stdlog, eth_write_queue->eth_raw, eth_write_queue->len);
+    hex_dump(stdlog, eth_write_queue->raw, eth_write_queue->len);
   }
   res = sendto(eth_socket, eth_write_queue, eth_write_queue->len, MSG_DONTWAIT,
                (struct sockaddr *)&dest_sa, sizeof dest_sa);

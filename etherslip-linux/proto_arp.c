@@ -263,7 +263,7 @@ bool arp_process_frame(struct eth_packet *frame) {
       if (verbose_log) {
         logf("arp: dropping bad packet; from broadcast address\n");
         if (very_verbose_log) {
-          hex_dump(stdlog, frame->eth_raw, frame->len);
+          hex_dump(stdlog, frame->raw, frame->len);
         }
       }
       goto skip_processing;

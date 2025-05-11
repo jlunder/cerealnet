@@ -57,9 +57,9 @@ void pkt_read_available(void) {
   socklen_t packet_addr_len = sizeof packet_addr;
   ssize_t len;
 
-  assert(sizeof frame->eth_raw == MAX_PACKET_SIZE);
+  assert(sizeof frame->raw == MAX_PACKET_SIZE);
   len =
-      recvfrom(pkt_recv_socket, &frame->ip, sizeof frame->ip.ip_raw,
+      recvfrom(pkt_recv_socket, &frame->ip, sizeof frame->ip.raw,
                MSG_DONTWAIT, (struct sockaddr *)&packet_addr, &packet_addr_len);
   if (len < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {

@@ -138,7 +138,7 @@ struct dhcp_msg {
 struct ip_packet {
   union {
     struct iphdr hdr;
-    uint8_t ip_raw[MAX_PACKET_SIZE - sizeof(struct ethhdr)];
+    uint8_t raw[MAX_PACKET_SIZE - sizeof(struct ethhdr)];
   };
 } __attribute__((packed));
 
@@ -151,7 +151,7 @@ struct eth_packet {
         struct ip_packet ip;
       };
     } __attribute__((packed));
-    uint8_t eth_raw[MAX_PACKET_SIZE];
+    uint8_t raw[MAX_PACKET_SIZE];
   };
   size_t len;
 } __attribute__((packed));

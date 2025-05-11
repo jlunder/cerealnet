@@ -253,7 +253,7 @@ bool arp_process_frame(struct eth_packet *frame) {
 
   // We take ownership of the packet from here, and are responsible for
   // deallocating it! Be careful about returning early.
-  if ((frame->recv_size >= sizeof frame->hdr + sizeof frame->arp) &&
+  if ((frame->len >= sizeof frame->hdr + sizeof frame->arp) &&
       ((ntohs(frame->arp.arp_hrd) == 1) || (ntohs(frame->arp.arp_hrd) == 6)) &&
       (frame->arp.arp_hln == ETH_ALEN) &&
       (frame->arp.arp_pln == sizeof(struct in_addr)) &&
@@ -263,7 +263,7 @@ bool arp_process_frame(struct eth_packet *frame) {
       if (verbose_log) {
         logf("arp: dropping bad packet; from broadcast address\n");
         if (very_verbose_log) {
-          hex_dump(stdlog, frame->eth_raw, frame->recv_size);
+          hex_dump(stdlog, frame->eth_raw, frame->len);
         }
       }
       goto skip_processing;
@@ -480,7 +480,7 @@ void arp_send_request(struct ether_addr from_mac, struct in_addr from_ip,
   memset(&frame->arp.arp_tha, 0, sizeof frame->arp.arp_tha);
   *(struct in_addr *)&frame->arp.arp_tpa = requesting_ip;
 
-  frame->recv_size = sizeof(frame->hdr) + sizeof(frame->arp);
+  frame->len = sizeof(frame->hdr) + sizeof(frame->arp);
 
   net_send_link_frame(frame);
 }
@@ -516,7 +516,7 @@ void arp_send_response(struct ether_addr from_mac, struct in_addr from_ip,
   *(struct ether_addr *)&frame->arp.arp_tha = to_mac;
   *(struct in_addr *)&frame->arp.arp_tpa = to_ip;
 
-  frame->recv_size = sizeof(frame->hdr) + sizeof(frame->arp);
+  frame->len = sizeof(frame->hdr) + sizeof(frame->arp);
 
   net_send_link_frame(frame);
 }

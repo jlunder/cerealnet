@@ -5,12 +5,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <netinet/ether.h>
+#include <netinet/if_ether.h>
 #include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 #include <netpacket/packet.h>
 #include <poll.h>
 #include <stdbool.h>
@@ -67,12 +67,6 @@
 // Should be big enough for a 9k jumbo frame (9038 bytes, plus a little grace)
 static_assert(MAX_PACKET_SIZE > 9100);
 
-struct ip_packet {
-  struct iphdr hdr;
-  // dhcp
-  uint8_t payload[IP_MAX_PAYLOAD];
-} __attribute__((packed));
-
 struct arp_eth_ip {
   struct ether_addr sha;
   struct in_addr spa;
@@ -80,12 +74,9 @@ struct arp_eth_ip {
   struct in_addr tpa;
 } __attribute__((packed));
 
-struct arp_packet {
-  struct arphdr hdr;
-  union {
-    struct arp_eth_ip eth_ip;
-    uint8_t payload[ARP_MAX_PAYLOAD];
-  };
+struct ip_packet {
+  struct iphdr hdr;
+  uint8_t opts[40];
 } __attribute__((packed));
 
 struct eth_packet {
@@ -94,21 +85,25 @@ struct eth_packet {
       struct ethhdr hdr;
       union {
         struct ip_packet ip;
-        struct arp_packet arp;
-        uint8_t packet[MAX_PACKET_SIZE - sizeof(struct iphdr) -
-                       sizeof(struct ethhdr)];
+        struct ether_arp arp;
+        uint8_t payload[MAX_PACKET_SIZE - sizeof(struct ethhdr)];
       };
     } __attribute__((packed));
-    uint8_t eth_raw[MAX_PACKET_SIZE];
+    uint8_t raw[MAX_PACKET_SIZE];
   };
-  size_t recv_size;
+  size_t len;
 } __attribute__((packed));
 
 static_assert(sizeof(struct eth_packet) == RAW_FRAME_STRUCT_SIZE);
 
+uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
+                            size_t header_size);
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size);
 
 int main(int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
+
   // Create a raw socket
   int eth_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
   if (eth_socket < 0) {
@@ -116,7 +111,7 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  struct ether_addr client_mac = {{0x00, 0x00, 0x00, 0x22, 0x34, 0x66}};
+  struct ether_addr client_mac = {{0x02, 0x01, 0x02, 0x03, 0x04, 0x05}};
   struct in_addr client_ip = {inet_addr("169.254.12.13")};
   struct ether_addr host_mac = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
   struct ether_addr const broadcast_mac = {
@@ -157,51 +152,77 @@ int main(int argc, char *argv[]) {
 
   struct eth_packet frame;
 
+  logf("Sending ARP packet\n");
+
   memcpy(&frame.hdr.h_dest, &broadcast_mac, ETH_ALEN);
   memcpy(&frame.hdr.h_source, &client_mac, ETH_ALEN);
   frame.hdr.h_proto = htons(ETH_P_ARP);
-  frame.arp.hdr.ar_hrd = htons(ARPHRD_ETHER);
-  frame.arp.hdr.ar_pro = htons(ETH_P_IP);
-  frame.arp.hdr.ar_hln = ETH_ALEN;
-  frame.arp.hdr.ar_pln = sizeof(struct in_addr);
-  frame.arp.hdr.ar_op = htons(ARPOP_REQUEST);
-  memcpy(&frame.arp.eth_ip.sha, &client_mac, ETH_ALEN);
-  frame.arp.eth_ip.spa = client_ip;
-  memcpy(&frame.arp.eth_ip.tha, &host_mac, ETH_ALEN);
-  frame.arp.eth_ip.tpa = this_host_ip;
-  frame.recv_size =
+  frame.arp.arp_hrd = htons(ARPHRD_ETHER);
+  frame.arp.arp_pro = htons(ETH_P_IP);
+  frame.arp.arp_hln = ETH_ALEN;
+  frame.arp.arp_pln = sizeof(struct in_addr);
+  frame.arp.arp_op = htons(ARPOP_REQUEST);
+  memcpy(&frame.arp.arp_sha, &client_mac, ETH_ALEN);
+  *(struct in_addr *)&frame.arp.arp_spa = client_ip;
+  memcpy(&frame.arp.arp_tha, &host_mac, ETH_ALEN);
+  ((struct in_addr *)&frame.arp.arp_tpa)->s_addr = htonl(INADDR_ANY);
+  frame.len =
       sizeof(struct ethhdr) + sizeof(struct arphdr) + sizeof(struct arp_eth_ip);
 
   ssize_t res;
   struct sockaddr_ll dest_sa;
+
   memset(&dest_sa, 0, sizeof dest_sa);
-  // dest_sa.sll_family = AF_PACKET;
-  // dest_sa.sll_protocol = frame.hdr.h_proto;
   dest_sa.sll_ifindex = if_index;
-  // dest_sa.sll_halen = ETH_ALEN;
-  // memcpy(&dest_sa.sll_addr, frame.hdr.h_dest, ETH_ALEN);
-#if 0
-  {
-    logf(
-        "eth write queued frame, %lu bytes, dest mac=%s; "
-        "hdr tot_len=%lu, proto=%02X, sa=%s, ",
-        (unsigned long)eth_write_queue->recv_size,
-        ether_ntoa((struct ether_addr const *)&eth_write_queue->hdr.h_dest),
-        (unsigned long)ntohs(eth_write_queue->ip.hdr.tot_len),
-        (int)eth_write_queue->ip.hdr.protocol,
-        inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.saddr));
-    logf("da=%s\n",
-         inet_ntoa(*(struct in_addr *)&eth_write_queue->ip.hdr.daddr));
-  }
-#endif
-  res = sendto(eth_socket, &frame, frame.recv_size, MSG_DONTWAIT,
+  res = sendto(eth_socket, &frame, frame.len, MSG_DONTWAIT,
                (struct sockaddr *)&dest_sa, sizeof dest_sa);
   if (res < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
-      perror("eth sendto() blocking");
+      perror("  sendto() blocking");
     }
-    perror("eth sendto() failed");
+    perror("  sendto() failed");
   }
+
+  logf("  sendto() succeeded!\n");
+
+  logf("Sending UDP packet\n");
+
+  memcpy(&frame.hdr.h_dest, &broadcast_mac, ETH_ALEN);
+  memcpy(&frame.hdr.h_source, &client_mac, ETH_ALEN);
+  frame.hdr.h_proto = htons(ETH_P_IP);
+  frame.ip.hdr.version = 4;
+  frame.ip.hdr.ihl = 5;  // 20 bytes
+  frame.ip.hdr.tos = 0;
+  frame.ip.hdr.tot_len = htons(20 + sizeof(struct udphdr) + 6);
+  frame.ip.hdr.id = 0x3942;
+  frame.ip.hdr.frag_off = 0;
+  frame.ip.hdr.ttl = 255;
+  frame.ip.hdr.protocol = IPPROTO_UDP;
+  frame.ip.hdr.check = 0;
+  frame.ip.hdr.saddr = htonl(INADDR_ANY);
+  frame.ip.hdr.daddr = htonl(INADDR_BROADCAST);
+  frame.ip.hdr.check = ip_header_checksum(&frame.ip, 20);
+  struct udphdr *udp = (struct udphdr *)&frame.ip.opts[0];
+  udp->source = htons(67);
+  udp->dest = htons(68);
+  udp->len = htons(sizeof(struct udphdr) + 6);
+  udp->check = 0;
+  uint8_t *payload = (uint8_t *)(udp + 1);
+  memcpy(payload, "hello", 6);
+  frame.len = (payload + 6) - frame.raw;
+
+  memset(&dest_sa, 0, sizeof dest_sa);
+  dest_sa.sll_ifindex = if_index;
+  res = sendto(eth_socket, &frame, frame.len, MSG_DONTWAIT,
+               (struct sockaddr *)&dest_sa, sizeof dest_sa);
+  if (res < 0) {
+    if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+      perror("  sendto() blocking");
+    }
+    perror("  sendto() failed");
+  }
+
+  logf("  sendto() succeeded!\n");
 
   close(eth_socket);
 
@@ -225,7 +246,7 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
 bool validate_eth_ip_frame(struct eth_packet const *frame) {
   uint16_t proto = ntohs(frame->hdr.h_proto);
 
-  if (frame->recv_size < sizeof(struct ethhdr)) {
+  if (frame->len < sizeof(struct ethhdr)) {
     return false;
   }
   if (proto < ETH_P_802_3_MIN) {
@@ -236,8 +257,7 @@ bool validate_eth_ip_frame(struct eth_packet const *frame) {
   if (proto != ETH_P_IP) {
     return false;
   }
-  return validate_ip_frame(&frame->ip,
-                           frame->recv_size - sizeof(struct ethhdr));
+  return validate_ip_frame(&frame->ip, frame->len - sizeof(struct ethhdr));
 }
 
 bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {

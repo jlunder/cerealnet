@@ -57,14 +57,28 @@ void eth_init(char const *if_name) {
   autoconf_success:
   } else {
     snprintf(eth_ifname, IF_NAMESIZE, "%s", if_name);
+    memset(&ioc_req, 0, sizeof ioc_req);
+    snprintf(ioc_req.ifr_name, IF_NAMESIZE, "%s", if_name);
+    if (ioctl(eth_socket, SIOCGIFINDEX, &ioc_req) < 0) {
+      perror("eth: get interface index failed");
+      exit(1);
+    }
+    if (ioc_req.ifr_ifindex < 1) {
+      logf("eth: ioctl(.., SIOCGIFINDEX, ..) returned implausible index %d\n",
+           ioc_req.ifr_ifindex);
+      exit(1);
+    }
+    eth_ifindex = ioc_req.ifr_ifindex;
   }
+
+  assert(eth_ifindex > 0);
 
   logf("eth: using interface %s\n", eth_ifname);
 
   memset(&ioc_req, 0, sizeof ioc_req);
   snprintf(ioc_req.ifr_name, IF_NAMESIZE, "%s", eth_ifname);
   if (ioctl(eth_socket, SIOCGIFHWADDR, &ioc_req) < 0) {
-    perror("get socket hardware address failed");
+    perror("eth: get interface hardware address failed");
     exit(1);
   }
   memcpy(&host_mac, ioc_req.ifr_hwaddr.sa_data, ETH_ALEN);
@@ -74,15 +88,10 @@ void eth_init(char const *if_name) {
   memset(&ifaddr, 0, sizeof ifaddr);
   ifaddr.sll_family = AF_PACKET;
   ifaddr.sll_ifindex = eth_ifindex;
-  bind(eth_socket, (struct sockaddr *)&ifaddr, sizeof ifaddr);
-
-  // memset(&if_ioreq, 0, sizeof if_ioreq);
-  // snprintf(if_ioreq.ifr_name, IFNAMSIZ, "%s", dev_name);
-  // if (ioctl(eth_socket, SIOCGIFHWADDR, &if_ioreq) < 0) {
-  //   perror("get socket hardware address failed");
-  //   exit(1);
-  // }
-  // memcpy(hwaddr, if_ioreq.ifr_hwaddr.sa_data, ETH_ALEN);
+  if (bind(eth_socket, (struct sockaddr *)&ifaddr, sizeof ifaddr) < 0) {
+    perror("eth: bind() to interface failed");
+    exit(1);
+  }
 }
 
 void eth_setup_pollfd(struct pollfd *pfd) {
@@ -117,7 +126,7 @@ void eth_read_available(void) {
     }
     free_packet_buf(frame);
   } else {
-    frame->recv_size = (size_t)recv_size;
+    frame->len = (size_t)recv_size;
     net_process_frame(frame);
   }
 }
@@ -156,23 +165,21 @@ void eth_try_write_all_queued(void) {
   struct sockaddr_ll dest_sa;
   memset(&dest_sa, 0, sizeof dest_sa);
   dest_sa.sll_ifindex = AF_PACKET;
-  dest_sa.sll_halen = ETH_ALEN;
-  dest_sa.sll_hatype = PACKET_OUTGOING;
-  memcpy(&dest_sa.sll_addr, eth_write_queue->hdr.h_dest, ETH_ALEN);
+  dest_sa.sll_ifindex = eth_ifindex;
   if (very_verbose_log && send_log) {
     logf(
         "eth write queued frame, %lu bytes, dest mac=%s; "
         "hdr tot_len=%lu, proto=%02X, sa=%s, ",
-        (unsigned long)eth_write_queue->recv_size,
+        (unsigned long)eth_write_queue->len,
         ether_ntoa((struct ether_addr const *)&eth_write_queue->hdr.h_dest),
         (unsigned long)ntohs(eth_write_queue->ip.hdr.tot_len),
         (int)eth_write_queue->ip.hdr.protocol,
         inet_ntoa(ip_get_saddr(&eth_write_queue->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&eth_write_queue->ip)));
-    hex_dump(stdlog, eth_write_queue->eth_raw, eth_write_queue->recv_size);
+    hex_dump(stdlog, eth_write_queue->eth_raw, eth_write_queue->len);
   }
-  res = sendto(eth_socket, eth_write_queue, eth_write_queue->recv_size,
-               MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);
+  res = sendto(eth_socket, eth_write_queue, eth_write_queue->len, MSG_DONTWAIT,
+               (struct sockaddr *)&dest_sa, sizeof dest_sa);
   if (res < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
       return;

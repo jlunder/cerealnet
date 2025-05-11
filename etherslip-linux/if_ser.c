@@ -167,7 +167,7 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
             logf("ser ignoring zero-length\n");
           }
         } else {
-          ser_read_accum->recv_size = sizeof(struct ethhdr) + used;
+          ser_read_accum->len = sizeof(struct ethhdr) + used;
           client_process_frame(ser_read_accum);
           ser_read_accum = NULL;
         }

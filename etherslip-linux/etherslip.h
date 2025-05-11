@@ -153,7 +153,7 @@ struct eth_packet {
     } __attribute__((packed));
     uint8_t eth_raw[MAX_PACKET_SIZE];
   };
-  size_t recv_size;
+  size_t len;
 } __attribute__((packed));
 
 static_assert(sizeof(struct ethhdr) == ETH_HLEN);
@@ -176,7 +176,7 @@ struct dhcp_info {
 
 typedef uint32_t time_ms_t;
 
-#define ETH_IP_SIZE(frame) (frame->recv_size - sizeof(struct ethhdr))
+#define ETH_IP_SIZE(frame) (frame->len - sizeof(struct ethhdr))
 
 extern bool recv_log;
 extern bool send_log;

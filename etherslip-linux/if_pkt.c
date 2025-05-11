@@ -55,13 +55,13 @@ void pkt_read_available(void) {
 
   struct sockaddr_storage packet_addr;
   socklen_t packet_addr_len = sizeof packet_addr;
-  ssize_t recv_size;
+  ssize_t len;
 
   assert(sizeof frame->eth_raw == MAX_PACKET_SIZE);
-  recv_size =
+  len =
       recvfrom(pkt_recv_socket, &frame->ip, sizeof frame->ip.ip_raw,
                MSG_DONTWAIT, (struct sockaddr *)&packet_addr, &packet_addr_len);
-  if (recv_size < 0) {
+  if (len < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
       // No message waiting after all
     } else {
@@ -74,7 +74,7 @@ void pkt_read_available(void) {
     memcpy(&frame->hdr.h_source, &broadcast_mac, sizeof(struct ether_addr));
     frame->hdr.h_proto = htons(ETH_P_IP);
 
-    frame->recv_size = sizeof(struct ethhdr) + recv_size;
+    frame->len = sizeof(struct ethhdr) + len;
     net_process_frame(frame);
   }
 }
@@ -116,14 +116,14 @@ void pkt_try_write_all_queued(void) {
     logf(
         "pkt write queued frame, %lu bytes, dest mac=%s; "
         "hdr tot_len=%lu, proto=%02X, sa=%s, ",
-        (unsigned long)pkt_write_queue->recv_size,
+        (unsigned long)pkt_write_queue->len,
         ether_ntoa((struct ether_addr const *)&pkt_write_queue->hdr.h_dest),
         (unsigned long)ntohs(pkt_write_queue->ip.hdr.tot_len),
         (int)pkt_write_queue->ip.hdr.protocol,
         inet_ntoa(ip_get_saddr(&pkt_write_queue->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&pkt_write_queue->ip)));
   }
-  res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->recv_size,
+  res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->len,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);
   if (res < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {

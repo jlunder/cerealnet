@@ -296,11 +296,11 @@ void poll_loop(void) {
 }
 
 void client_process_frame(struct eth_packet *frame) {
-  if (frame->recv_size < sizeof(struct ethhdr)) {
+  if (frame->len < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
     if (verbose_log && send_log) {
       logf("client packet runt frame (%lu bytes)\n",
-           (unsigned long)frame->recv_size);
+           (unsigned long)frame->len);
     }
   } else
     // validate_ip_frame not validate_eth_ip_frame, because the ethernet frame
@@ -330,7 +330,7 @@ bool client_forward_net_frame(struct eth_packet *frame) {
     logf(
         "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
         "sa=%s, ",
-        (unsigned long)frame->recv_size,
+        (unsigned long)frame->len,
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
@@ -345,16 +345,16 @@ bool client_forward_net_frame(struct eth_packet *frame) {
 }
 
 void net_process_frame(struct eth_packet *frame) {
-  if (frame->recv_size < sizeof(struct ethhdr)) {
+  if (frame->len < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
     if (verbose_log && recv_log) {
       logf("net packet runt frame (%lu bytes)\n",
-           (unsigned long)frame->recv_size);
+           (unsigned long)frame->len);
     }
-  } else if (frame->recv_size > MAX_PACKET_SIZE) {
+  } else if (frame->len > MAX_PACKET_SIZE) {
     // Ignore packet, too big (extra jumbo frame? We can't handle it)
     logf("net packet too big (trucated to %lu of %lu bytes)\n",
-         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->recv_size);
+         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->len);
   } else if (arp_process_frame(frame)) {
     frame = NULL;
   } else if (validate_eth_ip_frame(frame)) {
@@ -384,8 +384,8 @@ void net_process_frame(struct eth_packet *frame) {
            memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) == 0) ||
           (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0)) {
         logf("net packet not recognized (%lu bytes):\n",
-             (unsigned long)frame->recv_size);
-        hex_dump(stdlog, &frame->eth_raw, frame->recv_size);
+             (unsigned long)frame->len);
+        hex_dump(stdlog, &frame->eth_raw, frame->len);
       }
     }
   }
@@ -404,7 +404,7 @@ bool net_forward_client_frame(struct eth_packet *frame) {
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
-    hex_dump(stdlog, frame->eth_raw, frame->recv_size);
+    hex_dump(stdlog, frame->eth_raw, frame->len);
   }
 
   assert(validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame)));
@@ -787,7 +787,7 @@ bool dhcp_parse_options(uint8_t const *opts, size_t len,
 bool validate_eth_ip_frame(struct eth_packet const *frame) {
   uint16_t proto = ntohs(frame->hdr.h_proto);
 
-  if (frame->recv_size < sizeof(struct ethhdr)) {
+  if (frame->len < sizeof(struct ethhdr)) {
     return false;
   }
   if (proto < ETH_P_802_3_MIN) {

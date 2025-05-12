@@ -138,8 +138,6 @@ bool eth_send(struct eth_packet *frame) {
     return false;
   }
 
-  assert(validate_eth_ip_frame(frame));
-
   if (!client_ready) {
     // We need a MAC address to send, but if we're not ready it's uninitialized
     if (verbose_log) {

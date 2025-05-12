@@ -163,7 +163,13 @@ struct dhcp_info {
   struct ether_addr server_mac;
   struct in_addr client_ip;
   struct in_addr server_ip;
+  struct in_addr ciaddr;
+  struct in_addr yiaddr;  // i.e., assigned IP
+  struct in_addr siaddr;
   struct ether_addr chaddr;
+  struct in_addr subnet_mask;
+  struct in_addr broadcast;
+  struct in_addr router;
   bool client_to_broadcast;
   bool client_to_server;
   bool server_to_client;
@@ -175,8 +181,6 @@ struct dhcp_info {
 };
 
 typedef uint32_t time_ms_t;
-
-#define ETH_IP_SIZE(frame) (frame->len - sizeof(struct ethhdr))
 
 extern bool recv_log;
 extern bool send_log;
@@ -206,48 +210,39 @@ extern struct eth_packet packet_pool[PACKET_POOL_SIZE];
 extern struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 extern size_t packet_pool_unallocated_count;
 
-static inline time_ms_t time_ms_from_timespec(struct timespec ts) {
-  return (time_ms_t)((ts.tv_sec * 1000000000LL + ts.tv_nsec) / 1000000LL);
-}
-static inline time_ms_t time_since_ms(time_ms_t t_ms, time_ms_t base_ms) {
-  return t_ms - base_ms;
-}
-static inline bool is_time_past_ms(time_ms_t t_ms, time_ms_t ref_ms) {
-  return time_since_ms(t_ms, ref_ms) <= UINT32_MAX / 2;
-}
-static inline int32_t diff_ms(time_ms_t x_ms, time_ms_t y_ms) {
-  return (int32_t)x_ms - (int32_t)y_ms;
-}
-static inline bool is_reasonable_time_ms(time_ms_t t_ms) {
-  return t_ms <= UINT32_MAX / 4;
-}
-static inline bool is_reasonable_time_since_ms(time_ms_t t_ms,
-                                               time_ms_t ref_ms) {
-  return is_reasonable_time_ms(time_since_ms(t_ms, ref_ms));
-}
+// if_ser
 
-void parse_args(int argc, char *argv[]);
+void ser_init(char const *ser_dev_name);
+void ser_setup_pollfd(struct pollfd *pfd);
+void ser_read_available(void);
+void ser_accumulate_bytes(uint8_t *data, size_t size);
+bool ser_send(struct eth_packet *frame);
+bool ser_has_work(void);
+void ser_try_write_all_queued(void);
 
-void print_usage_and_exit(char const *argv0, char const *extra_message,
-                          int result);
+// if_eth
 
-void poll_loop(void);
+#if USE_IF_ETH
+void eth_init(char const *eth_dev_name);
+void eth_setup_pollfd(struct pollfd *pfd);
+void eth_read_available(void);
+bool eth_send(struct eth_packet *frame);
+bool eth_has_work(void);
+void eth_try_write_all_queued(void);
+#endif
 
-void client_process_frame(struct eth_packet *frame);
-bool client_forward_net_frame(struct eth_packet *frame);
+// if_pkt
 
-// Process a received frame (used by poll_loop)
-void net_process_frame(struct eth_packet *frame);
+#if USE_IF_PKT
+void pkt_init(void);
+void pkt_setup_pollfd(struct pollfd *pfd);
+void pkt_read_available(void);
+bool pkt_send(struct eth_packet *frame);
+bool pkt_has_work(void);
+void pkt_try_write_all_queued(void);
+#endif
 
-// Send a forwarded frame to the client via ser (internal)
-bool net_forward_client_frame(struct eth_packet *frame);
-
-// Send a link-level frame via eth or pkt (used by client, arp)
-bool net_send_link_frame(struct eth_packet *frame);
-
-void net_process_queued(void);
-
-bool net_waiting(void);
+// proto_arp
 
 bool arp_process_frame(struct eth_packet *frame);
 void arp_snoop_ip_frame(struct eth_packet const *frame);
@@ -263,40 +258,26 @@ void arp_send_announce(struct ether_addr announce_mac,
 
 void arp_idle(void);
 
-// bool dhcp_snoop_request(struct eth_packet *frame);
-// bool dhcp_snoop_response(struct eth_packet *frame);
+// proto_dhcp
 
-struct dhcp_msg *dhcp_parse_packet(struct eth_packet *frame,
-                                   struct dhcp_info *out_info);
-
+struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
+                                       struct dhcp_info *out_info);
 bool dhcp_parse_options(uint8_t const *opts, size_t len,
                         struct dhcp_info *out_info);
+void dhcp_dump_info_line(struct dhcp_info const *info);
 
-void ser_init(char const *ser_dev_name);
-void ser_setup_pollfd(struct pollfd *pfd);
-void ser_read_available(void);
-void ser_accumulate_bytes(uint8_t *data, size_t size);
-bool ser_send(struct eth_packet *frame);
-bool ser_has_work(void);
-void ser_try_write_all_queued(void);
+// proto_ip
 
-#if USE_IF_ETH
-void eth_init(char const *eth_dev_name);
-void eth_setup_pollfd(struct pollfd *pfd);
-void eth_read_available(void);
-bool eth_send(struct eth_packet *frame);
-bool eth_has_work(void);
-void eth_try_write_all_queued(void);
-#endif
+struct udphdr *udp_parse_ip_packet(struct ip_packet *ip_frame, size_t len);
 
-#if USE_IF_PKT
-void pkt_init(void);
-void pkt_setup_pollfd(struct pollfd *pfd);
-void pkt_read_available(void);
-bool pkt_send(struct eth_packet *frame);
-bool pkt_has_work(void);
-void pkt_try_write_all_queued(void);
-#endif
+bool ip_validate_frame(struct eth_packet const *frame);
+bool ip_validate_packet(struct ip_packet const *ip_frame, size_t size);
+uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
+                            size_t header_size);
+
+static inline size_t ip_len(struct eth_packet const *frame) {
+  return frame->len - sizeof(struct ethhdr);
+}
 
 static inline struct in_addr ip_get_daddr(struct ip_packet const *ip_frame) {
   struct in_addr result = {ntohl(ip_frame->hdr.daddr)};
@@ -316,16 +297,6 @@ static inline struct in_addr ip_get_saddr(struct ip_packet const *ip_frame) {
 static inline void ip_set_saddr(struct ip_packet *ip_frame,
                                 struct in_addr saddr) {
   ip_frame->hdr.saddr = htonl(saddr.s_addr);
-}
-
-uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
-                            size_t header_size);
-bool validate_eth_ip_frame(struct eth_packet const *frame);
-bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size);
-
-static inline bool eth_is_proper_mac(struct ether_addr mac_addr) {
-  return (memcmp(&mac_addr, &zero_mac, ETH_ALEN) != 0) &&
-         (memcmp(&mac_addr, &broadcast_mac, ETH_ALEN) != 0);
 }
 
 static inline bool ip_equals(struct in_addr a, struct in_addr b) {
@@ -363,6 +334,58 @@ static inline bool ip_is_proper(struct in_addr ip_addr) {
 static inline bool ip_is_this_host(struct in_addr ip_addr) {
   return ntohl(ip_addr.s_addr) == INADDR_ANY;
 }
+
+// utils
+
+static inline time_ms_t time_ms_from_timespec(struct timespec ts) {
+  return (time_ms_t)((ts.tv_sec * 1000000000LL + ts.tv_nsec) / 1000000LL);
+}
+static inline time_ms_t time_since_ms(time_ms_t t_ms, time_ms_t base_ms) {
+  return t_ms - base_ms;
+}
+static inline bool is_time_past_ms(time_ms_t t_ms, time_ms_t ref_ms) {
+  return time_since_ms(t_ms, ref_ms) <= UINT32_MAX / 2;
+}
+static inline int32_t diff_ms(time_ms_t x_ms, time_ms_t y_ms) {
+  return (int32_t)x_ms - (int32_t)y_ms;
+}
+static inline bool is_reasonable_time_ms(time_ms_t t_ms) {
+  return t_ms <= UINT32_MAX / 4;
+}
+static inline bool is_reasonable_time_since_ms(time_ms_t t_ms,
+                                               time_ms_t ref_ms) {
+  return is_reasonable_time_ms(time_since_ms(t_ms, ref_ms));
+}
+
+static inline bool eth_is_proper_mac(struct ether_addr mac_addr) {
+  return (memcmp(&mac_addr, &zero_mac, ETH_ALEN) != 0) &&
+         (memcmp(&mac_addr, &broadcast_mac, ETH_ALEN) != 0);
+}
+
+// etherslip
+
+void parse_args(int argc, char *argv[]);
+
+void print_usage_and_exit(char const *argv0, char const *extra_message,
+                          int result);
+
+void poll_loop(void);
+
+void client_process_frame(struct eth_packet *frame);
+bool client_forward_net_frame(struct eth_packet *frame);
+
+// Process a received frame (used by poll_loop)
+void net_process_frame(struct eth_packet *frame);
+
+// Send a forwarded frame to the client via ser (internal)
+bool net_forward_client_frame(struct eth_packet *frame);
+
+// Send a link-level frame via eth or pkt (used by client, arp)
+bool net_send_link_frame(struct eth_packet *frame);
+
+void net_process_queued(void);
+
+bool net_waiting(void);
 
 struct eth_packet *alloc_packet_buf(void);
 void free_packet_buf(struct eth_packet *packet);

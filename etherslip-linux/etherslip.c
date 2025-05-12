@@ -4,20 +4,10 @@
 
 static_assert(IS_POW2(NET_FORWARD_QUEUE_SIZE));
 
-struct udp_pseudoip {
-  struct in_addr saddr;
-  struct in_addr daddr;
-  uint8_t pad;
-  uint8_t protocol;
-  uint16_t udplen;
-} __attribute__((packed));
-
 struct net_forward_queue_entry {
   struct eth_packet *frame;
   time_ms_t submitted_ms;
 };
-
-uint16_t udp_checksum(struct ip_packet const *ip_frame, size_t udp_size);
 
 bool recv_log = false;
 bool send_log = false;
@@ -40,6 +30,8 @@ struct in_addr client_network = {INADDR_ANY};
 struct in_addr client_netmask = {INADDR_ANY};
 struct in_addr client_broadcast = {INADDR_BROADCAST};
 struct in_addr client_gateway = {INADDR_BROADCAST};
+
+struct ether_addr dhcp_last_chaddr = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 
 struct eth_packet packet_pool[PACKET_POOL_SIZE];
 struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
@@ -312,14 +304,14 @@ void client_process_frame(struct eth_packet *frame) {
       logf("client packet runt frame (%lu bytes)\n", (unsigned long)frame->len);
     }
   } else
-    // validate_ip_frame not validate_eth_ip_frame, because the ethernet frame
+    // ip_validate_packet not ip_validate_frame, because the ethernet frame
     // is forged for client (SLIP) packets anyway
-    if (!validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame))) {
+    if (!ip_validate_packet(&frame->ip, ip_len(frame))) {
       // Ignore packet, not valid IP
       if (verbose_log && send_log) {
         logf("client packet not valid (%lu bytes):\n",
-             (unsigned long)ETH_IP_SIZE(frame));
-        hex_dump(stdlog, frame->ip.raw, ETH_IP_SIZE(frame));
+             (unsigned long)ip_len(frame));
+        hex_dump(stdlog, frame->ip.raw, ip_len(frame));
       }
     } else if (net_forward_client_frame(frame)) {
       frame = NULL;
@@ -332,7 +324,7 @@ void client_process_frame(struct eth_packet *frame) {
 
 bool client_forward_net_frame(struct eth_packet *frame) {
   // Caller promises this is actually a valid IP packet
-  assert(validate_eth_ip_frame(frame));
+  assert(ip_validate_frame(frame));
 
   // A complete packet and we're ready for it!
   if (very_verbose_log && recv_log) {
@@ -342,6 +334,53 @@ bool client_forward_net_frame(struct eth_packet *frame) {
         (unsigned long)frame->len, (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
+  }
+
+  if ((memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0) &&
+      !ip_is_broadcast(ip_get_daddr(&frame->ip))) {
+    // TODO permit network-local broadcast
+    if (verbose_log) {
+      logf(
+          "client: sus packet with direct IP %s via broadcast MAC, not "
+          "forwarding\n",
+          inet_ntoa(ip_get_daddr(&frame->ip)));
+    }
+    return false;
+  }
+
+  if (frame->ip.hdr.protocol == IPPROTO_UDP) {
+    struct udphdr *udp = udp_parse_ip_packet(&frame->ip, ip_len(frame));
+
+    if (udp && client_ready &&
+        (memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) == 0)) {
+      // Snoop/masquerade DHCP
+      struct dhcp_info info;
+      struct dhcp_msg *dhcp = dhcp_parse_udp_packet(frame, &info);
+      if (dhcp != NULL) {
+        if (verbose_log) {
+          logf("client: snooping net DHCP; ");
+          dhcp_dump_info_line(&info);
+        }
+
+        // Does this chaddr match the client's? I.e. should we convert back
+        if (memcmp(&dhcp->chaddr, &dhcp_last_chaddr, ETH_ALEN) == 0) {
+          if (info.is_ack && ip_is_this_host(client_ip)) {
+            client_ip = info.yiaddr;
+          }
+          if (info.is_ack && ip_is_this_host(client_network)) {
+
+            client_netmask = info.subnet_mask;
+            client_network.s_addr = client_ip.s_addr & client_netmask.s_addr;
+            client_gateway = info.router;
+          }
+
+          // Rewrite client MAC address in packet
+          memcpy(&dhcp->chaddr, &client_mac, ETH_ALEN);
+          udp->check = htons(0);
+          udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
+        }
+      }
+    }
   }
 
   // TODO rewrite IP addresses for masquerading if needed
@@ -364,7 +403,7 @@ void net_process_frame(struct eth_packet *frame) {
          (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->len);
   } else if (arp_process_frame(frame)) {
     frame = NULL;
-  } else if (validate_eth_ip_frame(frame)) {
+  } else if (ip_validate_frame(frame)) {
     // Valid IP frame...
     arp_snoop_ip_frame(frame);
 #if USE_IF_ETH
@@ -407,16 +446,16 @@ bool net_forward_client_frame(struct eth_packet *frame) {
     logf(
         "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%d, "
         "sa=%s, ",
-        (unsigned long)ETH_IP_SIZE(frame),
+        (unsigned long)ip_len(frame),
         (unsigned long)ntohs(frame->ip.hdr.tot_len),
         (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
     hex_dump(stdlog, frame->raw, frame->len);
   }
 
-  assert(validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame)));
+  assert(ip_validate_packet(&frame->ip, ip_len(frame)));
 
-  if (!ip_is_proper(client_ip) && ip_is_proper(ip_get_saddr(&frame->ip))) {
+  if (ip_is_this_host(client_ip) && ip_is_proper(ip_get_saddr(&frame->ip))) {
     if (verbose_log) {
       logf("net: updating client IP from %s", inet_ntoa(client_ip));
       logf(" to %s (snooped outgoing)\n",
@@ -426,97 +465,49 @@ bool net_forward_client_frame(struct eth_packet *frame) {
   }
 
   if (frame->ip.hdr.protocol == IPPROTO_UDP) {
-    struct iphdr *ip = &frame->ip.hdr;
-    size_t header_len = ip->ihl * 4;
-    if (header_len + sizeof(struct udphdr) > ntohs(ip->tot_len)) {
-      // Not well formed
-      if (verbose_log) {
-        logf("net: runt UDP datagram from client, not forwarding\n");
-      }
-      return false;
-    }
-    struct udphdr *udp = (struct udphdr *)&frame->ip.raw[header_len];
-    size_t req_tot_len = header_len + ntohs(udp->len);
-    if (req_tot_len > ntohs(ip->tot_len)) {
-      // Not well formed
-      if (verbose_log) {
-        logf("net: UDP length %d does not match IP length %d, not forwarding\n",
-             (int)(header_len + ntohs(udp->len)), (int)ntohs(ip->tot_len));
-      }
-      return false;
-    }
-    if (udp->check != 0) {
-      uint16_t check = udp_checksum(&frame->ip, ntohs(udp->len));
-      if (check != 0xFFFF) {
-        if (verbose_log) {
-          logf(
-              "net: UDP checksum 0x%04X does not match computed 0x%04X, not "
-              "forwarding\n",
-              (unsigned)udp->check, (unsigned)check);
-        }
-        return false;
-      }
-    }
+    struct udphdr *udp = udp_parse_ip_packet(&frame->ip, ip_len(frame));
 
-    // Snoop/masquerade DHCP
-    struct dhcp_info info;
-    struct dhcp_msg *dhcp = dhcp_parse_packet(frame, &info);
-    if (dhcp != NULL) {
-      if (!client_ready &&
-          (info.client_to_broadcast || info.client_to_server)) {
-        if (eth_is_proper_mac(*(struct ether_addr *)&dhcp->chaddr)) {
-          logf("net: adopting client MAC %s from BOOTP/DHCP request\n",
-               ether_ntoa((struct ether_addr *)&dhcp->chaddr));
-          memcpy(&client_mac, &dhcp->chaddr, ETH_ALEN);
-          client_ready = true;
+    if (udp != NULL) {
+      // Snoop/masquerade DHCP
+      struct dhcp_info info;
+      struct dhcp_msg *dhcp = dhcp_parse_udp_packet(frame, &info);
+      if (dhcp != NULL) {
+        // Snarf the MAC address that the client thinks is its own
+        memcpy(&dhcp_last_chaddr, &dhcp->chaddr, ETH_ALEN);
+
+        if (!client_ready &&
+            (info.client_to_broadcast || info.client_to_server)) {
+          if (eth_is_proper_mac(*(struct ether_addr *)&dhcp->chaddr)) {
+            logf("net: adopting client MAC %s from BOOTP/DHCP request\n",
+                 ether_ntoa((struct ether_addr *)&dhcp->chaddr));
+            memcpy(&client_mac, &dhcp->chaddr, ETH_ALEN);
+            client_ready = true;
+          }
+          if (ip_is_proper(*(struct in_addr *)&dhcp->ciaddr)) {
+            logf("net: adopting initial client IP %s from BOOTP/DHCP request\n",
+                 inet_ntoa(dhcp->ciaddr));
+            client_ip = dhcp->ciaddr;
+          }
         }
-        if (ip_is_proper(*(struct in_addr *)&dhcp->ciaddr)) {
-          logf("net: adopting initial client IP %s from BOOTP/DHCP request\n",
+
+        if (verbose_log && !ip_equals(client_ip, dhcp->ciaddr)) {
+          logf("net: client supplied suspicious ciaddr %s",
                inet_ntoa(dhcp->ciaddr));
-          client_ip = dhcp->ciaddr;
+          logf("in snooped DHCP, expected %s\n", inet_ntoa(client_ip));
+        }
+
+        // Rewrite client MAC address in packet
+        memcpy(&dhcp->chaddr, &client_mac, ETH_ALEN);
+        udp->check = htons(0);
+        udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
+
+        if (verbose_log) {
+          // Re-parse
+          dhcp = dhcp_parse_udp_packet(frame, &info);
+          logf("net: snooping client DHCP; ");
+          dhcp_dump_info_line(&info);
         }
       }
-
-      if (verbose_log && !ip_equals(client_ip, dhcp->ciaddr)) {
-        logf("net: client supplied suspicious ciaddr %s",
-             inet_ntoa(dhcp->ciaddr));
-        logf("in snooped DHCP, expected %s\n", inet_ntoa(client_ip));
-      }
-
-      // Rewrite client MAC address in packet
-      memcpy(&dhcp->chaddr, &client_mac, ETH_ALEN);
-      udp->check = htons(0);
-      udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
-
-      // re-parse
-      dhcp = dhcp_parse_packet(frame, &info);
-      logf("net: snooping client DHCP");
-      logf(" from %s@%s", inet_ntoa(info.client_ip),
-           ether_ntoa(&info.client_mac));
-      logf(" to %s@%s\n", inet_ntoa(info.server_ip),
-           ether_ntoa(&info.server_mac));
-      logf("net: DHCP info, chaddr=%s", ether_ntoa(&info.chaddr));
-      if (info.client_to_broadcast) {
-        logf(" C->BC");
-      }
-      if (info.client_to_server) {
-        logf(" C->S");
-      }
-      if (info.server_to_client) {
-        logf(" S->C");
-      }
-      if (info.bootp_request) {
-        logf(" BREQ");
-      } else {
-        logf(" BREP");
-      }
-      if (info.is_discover) {
-        logf(" DISC");
-      }
-      if (info.is_ack) {
-        logf(" ACK");
-      }
-      logf("\n");
     }
   }
 
@@ -617,286 +608,6 @@ void net_process_queued(void) {
 }
 
 bool net_waiting(void) { return net_forward_queue_count > 0; }
-
-uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
-                            size_t header_size) {
-  uint8_t const *const buf = (uint8_t const *)ip_frame;
-  uint32_t checksum = 0;
-
-  for (size_t i = 0; i < header_size / 2; ++i) {
-    checksum += ((uint16_t const *)buf)[i];
-  }
-
-  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
-  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
-  return ~checksum & 0xFFFF;
-}
-
-uint16_t udp_checksum(struct ip_packet const *ip_frame, size_t udp_size) {
-  struct udp_pseudoip pseudo_ip;
-  pseudo_ip.saddr = ip_get_saddr(ip_frame);
-  pseudo_ip.daddr = ip_get_daddr(ip_frame);
-  pseudo_ip.pad = 0;
-  pseudo_ip.protocol = IPPROTO_UDP;
-  pseudo_ip.udplen = htons(udp_size);
-
-  assert(udp_size < 65535);
-  // This checksum can't overflow a uint32 for a valid-sized UDP packet, but the
-  // size restriction imposed by UDP is critical. At max packet size of 64k, we
-  // will sum to 32768 * 65535, which is getting close to INT32_MAX
-  uint32_t checksum = 0;
-
-  // Checksum the pseudo-IP header
-  for (size_t i = 0; i < sizeof(pseudo_ip) / 2; ++i) {
-    checksum += ntohs(((uint16_t const *)&pseudo_ip)[i]);
-  }
-  // Checksum the datagram
-  for (size_t i = 0; i < udp_size / 2; ++i) {
-    checksum += ntohs(((uint16_t const *)(ip_frame->raw + ip_frame->hdr.ihl * 4))[i]);
-  }
-  // For odd size, add in an implicitly padded last word
-  if ((udp_size & 1) != 0) {
-    checksum += ntohs((ip_frame->raw + ip_frame->hdr.ihl * 4)[udp_size - 1]);
-  }
-
-  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
-  checksum = ((checksum >> 16) + (checksum & 0xFFFF));
-  assert(checksum <= 0xFFFF);
-  checksum = ~checksum & 0xFFFF;
-  if (checksum == 0) {
-    checksum = 0xFFFF;
-  }
-  return htons(checksum);
-}
-
-struct dhcp_msg *dhcp_parse_packet(struct eth_packet *frame,
-                                   struct dhcp_info *out_info) {
-  assert(out_info != NULL);
-
-  struct iphdr *ip = &frame->ip.hdr;
-  size_t header_len = ip->ihl * 4;
-  struct udphdr *udp = (struct udphdr *)&frame->ip.raw[header_len];
-
-  // These should already have been checked -- is it valid UDP?
-  assert(frame->ip.hdr.protocol == IPPROTO_UDP);
-  assert(header_len + sizeof(struct udphdr) <= ntohs(ip->tot_len));
-  assert(header_len + ntohs(udp->len) == ntohs(ip->tot_len));
-
-  // Clear our output struct
-  memset(out_info, 0, sizeof *out_info);
-
-  // In theory, we should compute/check the checksum, if it's set
-
-  if ((ntohs(udp->source) == 68) && (ntohs(udp->dest) == 67)) {
-    if (ip->daddr == INADDR_BROADCAST) {
-      out_info->client_to_broadcast = true;
-    } else {
-      out_info->client_to_server = true;
-    }
-    memcpy(&out_info->client_mac, &frame->hdr.h_source, ETH_ALEN);
-    out_info->client_ip = ip_get_saddr(&frame->ip);
-    memcpy(&out_info->server_mac, &frame->hdr.h_dest, ETH_ALEN);
-    out_info->server_ip = ip_get_daddr(&frame->ip);
-  } else if ((udp->source == 67) && (udp->dest == 68)) {
-    out_info->server_to_client = true;
-    memcpy(&out_info->client_mac, &frame->hdr.h_dest, ETH_ALEN);
-    out_info->client_ip = ip_get_daddr(&frame->ip);
-    memcpy(&out_info->server_mac, &frame->hdr.h_source, ETH_ALEN);
-    out_info->server_ip = ip_get_saddr(&frame->ip);
-  } else {
-    // Probably not BOOTP/DHCP at all
-    if (very_verbose_log) {
-      logf("dhcp_parse: ignoring packet from source port %u to dest port %u\n",
-           (unsigned short)ntohs(udp->source),
-           (unsigned short)ntohs(udp->dest));
-    }
-    return NULL;
-  }
-
-  if (ntohs(udp->len) < offsetof(struct dhcp_msg, options) + 4) {
-    if (verbose_log) {
-      logf("dhcp_parse: truncated datagram, %d\n", (int)ntohs(udp->len));
-    }
-    return NULL;
-  }
-
-  struct dhcp_msg *dhcp =
-      (struct dhcp_msg *)&frame->ip.raw[header_len + sizeof(struct udphdr)];
-
-  if ((dhcp->htype != ARPHRD_ETHER) || (dhcp->hlen != ETH_ALEN)) {
-    if (verbose_log) {
-      logf("dhcp_parse: invalid htype/hlen %d/%d\n", (int)dhcp->htype,
-           (int)dhcp->hlen);
-    }
-    return NULL;
-  }
-  if (ntohl(*(uint32_t *)dhcp->options) != 0x63825363) {
-    if (verbose_log) {
-      logf("dhcp_parse: invalid options magic %08lX\n",
-           (unsigned long)*(uint32_t *)dhcp->options);
-    }
-    return NULL;
-  }
-
-  memcpy(&out_info->chaddr, &dhcp->chaddr, ETH_ALEN);
-
-  if (dhcp->op == 1) {
-    out_info->bootp_request = true;
-  } else if (dhcp->op == 2) {
-    out_info->bootp_request = false;
-  } else {
-    if (verbose_log) {
-      logf("dhcp_parse: invalid bootp op %d\n", (int)dhcp->op);
-    }
-    return NULL;
-  }
-
-  uint8_t *opts_end = &frame->ip.raw[ntohs(ip->tot_len)];
-  if (!dhcp_parse_options(dhcp->options + 4, opts_end - (dhcp->options + 4),
-                          out_info)) {
-    return NULL;
-  }
-  if (out_info->options_in_file) {
-    if (!dhcp_parse_options(dhcp->file, sizeof dhcp->file, out_info)) {
-      return NULL;
-    }
-  }
-  if (out_info->options_in_sname) {
-    if (!dhcp_parse_options(dhcp->sname, sizeof dhcp->sname, out_info)) {
-      return NULL;
-    }
-  }
-  return dhcp;
-}
-
-bool dhcp_parse_options(uint8_t const *opts, size_t len,
-                        struct dhcp_info *out_info) {
-  size_t i = 0;
-  bool proper_termination = false;
-  while (i < len) {
-    uint8_t optcode = opts[i++];
-    if (optcode == 0x00) continue;
-    if (optcode == 0xFF) {
-      proper_termination = true;
-      break;
-    }
-    if (i >= len) {
-      if (verbose_log) {
-        logf("dhcp_parse: option %d overruns buffer at %d/%d\n", (int)optcode,
-             (int)(i - 1), (int)len);
-      }
-      return false;
-    }
-    uint8_t optlen = opts[i++];
-    if (i + optlen > len) {
-      if (verbose_log) {
-        logf("dhcp_parse: option %d with length %d overruns buffer at %d/%d\n",
-             (int)optcode, (int)optlen, (int)(i - 2), (int)len);
-      }
-      return false;
-    }
-    switch (optcode) {
-      case 52: {
-        if (optlen != 1) return false;
-        if (opts[i] < 1 || opts[i] > 3) {
-          if (verbose_log) {
-            logf(
-                "dhcp_parse: invalid option 52 (Option Overload), %d at "
-                "%d/%d\n",
-                (int)opts[i], (int)i, (int)len);
-          }
-          return false;
-        }
-        if ((opts[i] == 1) || (opts[i] == 3)) {
-          out_info->options_in_file = true;
-        }
-        if ((opts[i] == 2) || (opts[i] == 3)) {
-          out_info->options_in_sname = true;
-        }
-      } break;
-      case 53: {
-        if (optlen != 1) return false;
-        if (opts[i] < 1 || opts[i] > 8) {
-          if (verbose_log) {
-            logf(
-                "dhcp_parse: invalid option 53 (DHCP Message Type), %d at "
-                "%d/%d\n",
-                (int)opts[i], (int)i, (int)len);
-          }
-          return false;
-        }
-        if (opts[i] == 1) {
-          out_info->is_discover = true;
-        } else if (opts[i] == 5) {
-          out_info->is_ack = true;
-        }
-      } break;
-      default: {
-        // ignore
-      }
-    }
-    i += optlen;
-  }
-  if (!proper_termination && verbose_log) {
-    logf("dhcp_parse: options not properly terminated, at %d\n", (int)len);
-  }
-  return true;
-}
-
-bool validate_eth_ip_frame(struct eth_packet const *frame) {
-  uint16_t proto = ntohs(frame->hdr.h_proto);
-
-  if (frame->len < sizeof(struct ethhdr)) {
-    return false;
-  }
-  if (proto < ETH_P_802_3_MIN) {
-    // size = proto;
-    // proto = ETH_P_802_3;
-    return false;
-  }
-  if (proto != ETH_P_IP) {
-    return false;
-  }
-  return validate_ip_frame(&frame->ip, ETH_IP_SIZE(frame));
-}
-
-bool validate_ip_frame(struct ip_packet const *ip_frame, size_t size) {
-  if (size < sizeof(struct iphdr)) {
-    logf("invalid IP packet: truncated header (runt)\n");
-    return false;
-  }
-  // The order of these tests is important -- some of them depend on prior
-  // tests passing to be safe, e.g. checking the header checksum after
-  // verifying that the received packet isn't truncated
-  if (ip_frame->hdr.version != 4) {
-    // IPv6 is common enough we don't want to spam about it unbidden
-    if ((ip_frame->hdr.version != 6) || very_verbose_log) {
-      logf("invalid IP packet: bad version (%d)\n", (int)ip_frame->hdr.version);
-    }
-    return false;
-  }
-  size_t header_size = ip_frame->hdr.ihl * 4;
-  if (header_size < sizeof(struct iphdr)) {
-    logf("invalid IP packet: bad header size (%d)\n", (int)header_size);
-    return false;
-  }
-  if (size < header_size) {
-    logf("invalid IP packet: truncated header\n");
-    return false;
-  }
-  uint16_t checksum = ip_header_checksum(ip_frame, header_size);
-  if (checksum != 0) {
-    logf("invalid IP packet: bad header checksum\n");
-    return false;
-  }
-  if (size < ntohs(ip_frame->hdr.tot_len)) {
-    logf("invalid IP packet: truncated packet (%d of %d)\n", (int)size,
-         (int)ntohs(ip_frame->hdr.tot_len));
-    return false;
-  }
-
-  return true;
-}
 
 struct eth_packet *alloc_packet_buf(void) {
   if (packet_pool_unallocated_count > 0) {

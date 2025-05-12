@@ -129,13 +129,14 @@ void eth_read_available(void) {
       exit(1);
     }
   } else {
-    if(recv_size > MAX_PACKET_SIZE) {
-      logf("eth: recvfrom() returned unbelievable size %lu\n", (unsigned long)recv_size);
+    if ((size_t)recv_size > MAX_PACKET_SIZE) {
+      logf("eth: recvfrom() returned unbelievable size %lu\n",
+           (unsigned long)recv_size);
       exit(1);
     }
     frame->x.len = (size_t)recv_size;
     if (log_net_inbound) {
-      log_frame("eth: read frame,", "eth:   ", frame);
+      log_frame("eth: read frame,", "eth:  ", frame);
     }
     net_process_frame(frame);
   }
@@ -157,6 +158,10 @@ bool eth_send(struct eth_packet *frame) {
     return true;
   }
 
+  if (log_net_outbound) {
+    log_frame("eth: writing frame,", "eth:  ", frame);
+  }
+
   eth_write_queue = frame;
   eth_try_write_all_queued();
   return true;
@@ -175,7 +180,9 @@ void eth_try_write_all_queued(void) {
   dest_sa.sll_ifindex = AF_PACKET;
   dest_sa.sll_ifindex = eth_ifindex;
   if (log_net_outbound) {
-    logf("eth: writing queued frame, tid %lu, %lu bytes, ");
+    logf("eth: writing queued frame, tid %lu, %lu bytes, ",
+         (unsigned long)eth_write_queue->x.tracking_id,
+         (unsigned long)eth_write_queue->x.len);
   }
   res = sendto(eth_socket, eth_write_queue, eth_write_queue->x.len,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);

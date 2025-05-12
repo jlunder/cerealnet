@@ -89,7 +89,7 @@ bool pkt_send(struct eth_packet *frame) {
   }
 
   struct ip_packet *ip_frame = &frame->ip;
-  assert(ip_validate_packet(frame));
+  assert(ip_validate_packet(frame, NULL));
 
   if (log_very_verbose && log_send) {
     logf("pkt_send packet:\n");

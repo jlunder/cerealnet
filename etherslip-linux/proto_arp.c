@@ -202,8 +202,8 @@ bool arp_fetch_address(struct in_addr requesting_ip, struct in_addr ip_addr,
         // There's an in-flight entry, but let's see if it's time to retry
         time_ms_t wait_ms = time_since_ms(now_ms, entry->last_state_ms);
         assert(entry->backoff <= ARP_REQUEST_RETRY_BACKOFF_MAX);
-        time_ms_t backoff_ms = wait_ms << ((time_ms_t)entry->backoff);
-        assert(backoff_ms >= ARP_REQUEST_RETRY_INITIAL_MS);
+        time_ms_t backoff_ms = ARP_REQUEST_RETRY_INITIAL_MS
+                               << ((time_ms_t)entry->backoff);
         if (wait_ms > backoff_ms) {
           if (log_arp_states || log_arp_usage) {
             logf("resending\n");
@@ -790,7 +790,8 @@ static void arp_age_entry(struct arp_cache_entry *entry) {
   }
 
   assert(ip_is_proper(entry->ip_addr));
-  assert(memcmp(&entry->mac_addr, &broadcast_mac, ETH_ALEN) != 0);
+  assert((memcmp(&entry->mac_addr, &broadcast_mac, ETH_ALEN) == 0) ==
+         (entry->state == ARP_STATE_REQUESTED));
   assert(memcmp(&entry->mac_addr, &zero_mac, ETH_ALEN) != 0);
 
   time_ms_t entry_age = time_since_ms(now_ms, entry->last_seen_ms);
@@ -814,7 +815,7 @@ static void arp_age_entry(struct arp_cache_entry *entry) {
   if ((entry->state == ARP_STATE_COOLDOWN) &&
       (time_since_ms(now_ms, entry->last_state_ms) >= ARP_COOLDOWN_MS)) {
     if (log_arp_states) {
-      logf("arp: %s changed state, COOLDOWN -> VALID",
+      logf("arp: %s changed state, COOLDOWN -> VALID\n",
            inet_ntoa(*(struct in_addr *)&entry->ip_addr));
     }
     entry->state = ARP_STATE_VALID;

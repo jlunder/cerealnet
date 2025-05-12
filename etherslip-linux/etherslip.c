@@ -54,6 +54,9 @@ size_t net_forward_queue_count = 0;
 
 int main(int argc, char *argv[]) {
   for (size_t i = 0; i < PACKET_POOL_SIZE; ++i) {
+#if !defined(NDEBUG)
+    packet_pool[i].x.tracking_id = 1;
+#endif
     free_packet_buf(&packet_pool[i]);
   }
 
@@ -331,25 +334,13 @@ void poll_loop(void) {
 }
 
 void client_process_frame(struct eth_packet *frame) {
-  if (frame->x.len < sizeof(struct ethhdr)) {
-    // Runt ethernet frame? Not long enough for MAC??
-    if (log_client_inbound) {
-      logf("client packet runt frame (%lu bytes)\n",
-           (unsigned long)frame->x.len);
-    }
-  } else
-    // ip_validate_packet not ip_validate_frame, because the ethernet frame
-    // is forged for client (SLIP) packets anyway
-    if (!ip_validate_packet(frame)) {
-      // Ignore packet, not valid IP
-      if (log_client_inbound) {
-        logf("client: packet not valid (%lu bytes)\n",
-             (unsigned long)ip_len(frame));
-        hex_dump(stdlog, "client:   ", frame->ip.raw, ip_len(frame));
-      }
-    } else if (net_forward_client_frame(frame)) {
-      frame = NULL;
-    }
+  frame->hdr.h_proto = htons(ETH_P_IP);
+
+  if (!ip_validate_frame(frame, log_client_inbound ? "client:" : NULL)) {
+    // Ignore packet, not valid IP
+  } else if (net_forward_client_frame(frame)) {
+    frame = NULL;
+  }
 
   if (frame != NULL) {
     free_packet_buf(frame);
@@ -358,7 +349,7 @@ void client_process_frame(struct eth_packet *frame) {
 
 bool client_forward_net_frame(struct eth_packet *frame) {
   // Caller promises this is actually a valid IP packet
-  assert(ip_validate_frame(frame));
+  assert(ip_validate_frame(frame, NULL));
 
   if ((memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0) &&
       !ip_is_broadcast(ip_get_daddr(&frame->ip))) {
@@ -400,13 +391,13 @@ bool client_forward_net_frame(struct eth_packet *frame) {
 
           if (log_dhcp_processing) {
             logf("client: rewriting chaddr from %s ",
-                 ether_ntoa(&dhcp->chaddr));
+                 ether_ntoa((struct ether_addr *)&dhcp->chaddr));
             logf("to %s\n", ether_ntoa(&dhcp_last_chaddr));
           }
           // Rewrite client MAC address in packet
           memcpy(&dhcp->chaddr, &dhcp_last_chaddr, ETH_ALEN);
           udp->check = htons(0);
-          udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
+          udp->check = udp_checksum(&frame->ip, udp, ntohs(udp->len));
         }
       }
     }
@@ -423,47 +414,51 @@ void net_process_frame(struct eth_packet *frame) {
   if (frame->x.len < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
     if (log_verbose) {
-      logf("net: runt frame (%lu bytes), tid %lu\n",
-           (unsigned long)frame->x.len, (unsigned long)frame->x.tracking_id);
+      logf("net: tid %lu runt frame (%lu bytes), dropping\n",
+           (unsigned long)frame->x.tracking_id, (unsigned long)frame->x.len);
     }
   } else if (arp_process_frame(frame)) {
     frame = NULL;
-  } else if (ip_validate_frame(frame)) {
-    // Valid IP frame...
-    arp_snoop_ip_frame(frame);
-#if USE_IF_ETH
-    if ((!client_ready ||
-         memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
-        (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
-      // TODO multicast support? Not sure how this works
-      if (log_forwarding && log_very_verbose) {
-        logf("net: packet for another host (%s), tid %lu\n",
-             ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest),
+  } else if (frame->hdr.h_proto == htons(ETH_P_IP)) {
+    // IP frame, supposedly...
+    if (!ip_validate_frame(frame,
+                           (log_forwarding && log_verbose) ? "net:" : NULL)) {
+      if (log_forwarding) {
+        logf("net: tid %lu h_proto is ETH_P_IP but is not valid IP, dropping\n",
              (unsigned long)frame->x.tracking_id);
       }
     } else {
-#endif
-      if (client_ready) {
-        if (log_forwarding) {
-          logf("net: attempting to forward to client, tid %lu\n",
-               (unsigned long)frame->x.tracking_id);
-        }
-        if (client_forward_net_frame(frame)) {
-          frame = NULL;
-        }
-      }
+      arp_snoop_ip_frame(frame);
 #if USE_IF_ETH
-    }
+      if ((!client_ready ||
+           memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
+          (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
+        // TODO multicast support? Not sure how this works
+        if (log_forwarding && log_very_verbose) {
+          logf("net: tid %lu for another host (%s), dropping\n",
+               (unsigned long)frame->x.tracking_id,
+               ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest));
+        }
+      } else {
 #endif
-  } else {
-    // Ignore packet: it's not valid IP
-    if (log_forwarding && log_very_verbose) {
-      if ((client_ready &&
-           memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) == 0) ||
-          (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0)) {
-        logf("net: packet not valid IP, tid %lu\n", (unsigned long)frame->x.len,
-             (unsigned long)frame->x.tracking_id);
+        if (client_ready) {
+          if (log_forwarding) {
+            logf("net: tid %lu forwarding to client\n",
+                 (unsigned long)frame->x.tracking_id);
+          }
+          if (client_forward_net_frame(frame)) {
+            frame = NULL;
+          }
+        }
+#if USE_IF_ETH
       }
+#endif
+    }
+  } else {
+    // Ignore packet: it's not even trying to be IP
+    if (log_forwarding && log_very_verbose) {
+      logf("net: packet not valid IP, tid %lu\n",
+           (unsigned long)frame->x.tracking_id);
     }
   }
 
@@ -473,7 +468,7 @@ void net_process_frame(struct eth_packet *frame) {
 }
 
 bool net_forward_client_frame(struct eth_packet *frame) {
-  assert(ip_validate_packet(frame));
+  assert(ip_validate_packet(frame, NULL));
 
   if (ip_is_this_host(client_ip) && ip_is_proper(ip_get_saddr(&frame->ip))) {
     if (log_forwarding && log_verbose) {
@@ -519,7 +514,7 @@ bool net_forward_client_frame(struct eth_packet *frame) {
         // Rewrite client MAC address in packet
         memcpy(&dhcp->chaddr, &client_mac, ETH_ALEN);
         udp->check = htons(0);
-        udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
+        udp->check = udp_checksum(&frame->ip, udp, ntohs(udp->len));
 
         if (log_dhcp_processing) {
           // Re-parse
@@ -729,6 +724,6 @@ void hex_dump(FILE *f, char const *prefix, void const *buf, size_t size) {
     line[k++] = '|';
     line[k++] = '\n';
     line[k++] = '\0';
-    fprintf(f, "%s%s", prefix, line);
+    fprintf(f, "%s %s", prefix, line);
   }
 }

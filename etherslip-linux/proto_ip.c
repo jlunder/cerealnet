@@ -8,34 +8,47 @@ struct udp_pseudoip {
   uint16_t udplen;
 } __attribute__((packed));
 
-bool ip_validate_frame(struct eth_packet const *frame) {
+bool ip_validate_frame(struct eth_packet const *frame, char const *err_prefix) {
   uint16_t proto = ntohs(frame->hdr.h_proto);
 
   if (frame->x.len < sizeof(struct ethhdr)) {
-    logf("ip: invalid IP frame: truncated ethernet header (runt)\n");
+    if (err_prefix != NULL) {
+      logf("%s tid %lu not valid IP frame, truncated ethernet header (runt)\n",
+           err_prefix, (unsigned long)frame->x.tracking_id);
+    }
     return false;
   }
   if (proto < ETH_P_802_3_MIN) {
-    logf(
-        "ip: invalid IP frame: not ethernet II (proto %u maybe matches size "
-        "%lu?)\n",
-        (unsigned)proto, (unsigned long)frame->x.len);
+    if (err_prefix != NULL) {
+      logf(
+          "%s tid %lu not valid IP frame, not ethernet II (proto %u maybe "
+          "matches size %lu?)\n",
+          err_prefix, (unsigned long)frame->x.tracking_id, (unsigned)proto,
+          (unsigned long)frame->x.len);
+    }
     // size = proto;
     // proto = ETH_P_802_3;
     return false;
   }
   if (proto != ETH_P_IP) {
-    logf("ip: invalid IP frame: wrong protocol (%u)\n", (unsigned)proto);
+    if (err_prefix != NULL) {
+      logf("%s tid %lu not valid IP frame, wrong protocol (%u)\n", err_prefix,
+           (unsigned long)frame->x.tracking_id, (unsigned)proto);
+    }
     return false;
   }
-  return ip_validate_packet(frame);
+  return ip_validate_packet(frame, err_prefix);
 }
 
-bool ip_validate_packet(struct eth_packet const *frame) {
+bool ip_validate_packet(struct eth_packet const *frame,
+                        char const *err_prefix) {
   size_t size = ip_len(frame);
 
   if (size < sizeof(struct iphdr)) {
-    logf("ip: invalid IP packet: truncated header (runt)\n");
+    if (err_prefix != NULL) {
+      logf("%s tid %lu not valid IP, truncated header (runt)\n", err_prefix,
+           (unsigned long)frame->x.tracking_id);
+    }
     return false;
   }
   // The order of these tests is important -- some of them depend on prior
@@ -43,29 +56,42 @@ bool ip_validate_packet(struct eth_packet const *frame) {
   // verifying that the received packet isn't truncated
   if (frame->ip.hdr.version != 4) {
     // IPv6 is common enough we don't want to spam about it unbidden
-    if ((frame->ip.hdr.version != 6) || log_very_verbose) {
-      logf("ip: invalid IP packet: bad version (%d)\n",
-           (int)frame->ip.hdr.version);
+    if ((err_prefix != NULL) &&
+        ((frame->ip.hdr.version != 6) || log_very_verbose)) {
+      logf("%s tid %lu not valid IP, bad version (%d)\n", err_prefix,
+           (unsigned long)frame->x.tracking_id, (int)frame->ip.hdr.version);
     }
     return false;
   }
   size_t header_size = frame->ip.hdr.ihl * 4;
   if (header_size < sizeof(struct iphdr)) {
-    logf("ip: invalid IP packet: bad header size (%d)\n", (int)header_size);
+    if (err_prefix != NULL) {
+      logf("%s tid %lu not valid IP, bad header size (%d)\n", err_prefix,
+           (unsigned long)frame->x.tracking_id, (int)header_size);
+    }
     return false;
   }
   if (size < header_size) {
-    logf("ip: invalid IP packet: truncated header\n");
+    if (err_prefix != NULL) {
+      logf("%s tid %lu not valid IP, truncated header\n", err_prefix,
+           (unsigned long)frame->x.tracking_id);
+    }
     return false;
   }
   uint16_t checksum = ip_header_checksum(&frame->ip, header_size);
   if (checksum != 0) {
-    logf("ip: invalid IP packet: bad header checksum\n");
+    if (err_prefix != NULL) {
+      logf("%s tid %lu not valid IP, bad header checksum\n", err_prefix,
+           (unsigned long)frame->x.tracking_id);
+    }
     return false;
   }
   if (size < ntohs(frame->ip.hdr.tot_len)) {
-    logf("ip: invalid IP packet: truncated packet (%d of %d)\n", (int)size,
-         (int)ntohs(frame->ip.hdr.tot_len));
+    if (err_prefix != NULL) {
+      logf("%s tid %lu not valid IP, truncated packet (%d of %d)\n", err_prefix,
+           (unsigned long)frame->x.tracking_id, (int)size,
+           (int)ntohs(frame->ip.hdr.tot_len));
+    }
     return false;
   }
 
@@ -87,7 +113,7 @@ uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
 }
 
 struct udphdr *udp_parse_ip_packet(struct eth_packet *frame) {
-  assert(ip_validate_packet(frame));
+  assert(ip_validate_packet(frame, NULL));
 
   size_t header_len = frame->ip.hdr.ihl * 4;
   if (header_len + sizeof(struct udphdr) > ntohs(frame->ip.hdr.tot_len)) {

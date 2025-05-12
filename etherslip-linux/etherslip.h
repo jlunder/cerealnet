@@ -276,15 +276,16 @@ void arp_idle(void);
 
 struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
                                        struct dhcp_info *out_info);
-uint16_t udp_checksum(struct ip_packet const *ip_frame, size_t udp_size);
+uint16_t udp_checksum(struct ip_packet const *ip, struct udphdr *udp,
+                      size_t udp_size);
 void dhcp_dump_info_line(struct dhcp_info const *info);
 
 // proto_ip
 
 struct udphdr *udp_parse_ip_packet(struct eth_packet *frame);
 
-bool ip_validate_frame(struct eth_packet const *frame);
-bool ip_validate_packet(struct eth_packet const *frame);
+bool ip_validate_frame(struct eth_packet const *frame, char const *err_prefix);
+bool ip_validate_packet(struct eth_packet const *frame, char const *err_prefix);
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size);
 

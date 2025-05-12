@@ -30,7 +30,7 @@ size_t ser_send_tail = 0;
 
 int ser_fd;
 
-size_t ser_accumulate_bytes(uint8_t *data, size_t size);
+void ser_decode(uint8_t *data, size_t size);
 
 void ser_init(char const *ser_dev_name) {
   // TODO enumerate serial devices
@@ -102,11 +102,11 @@ void ser_read_available(void) {
       exit(1);
     }
 
-    ser_decode_remaining(read_buf, (size_t)res);
+    ser_decode(read_buf, (size_t)res);
   } while (res == sizeof read_buf);
 }
 
-void ser_decode_remaining(uint8_t *data, size_t size) {
+void ser_decode(uint8_t *data, size_t size) {
   size_t i = 0;
 
   // Discard the remainder of the packet if we're supposed to do that
@@ -133,6 +133,7 @@ void ser_decode_remaining(uint8_t *data, size_t size) {
       return;
     }
     memset(&ser_read_accum->hdr, 0, sizeof ser_read_accum->hdr);
+    ser_read_accum->hdr.h_proto = htons(ETH_P_IP);
     ser_read_accum->x.len = 0;
   }
 
@@ -217,7 +218,7 @@ void ser_decode_remaining(uint8_t *data, size_t size) {
           }
           ser_read_accum->x.len = sizeof(struct ethhdr) + used;
           if (log_client_inbound) {
-            log_frame("ser: read complete frame,", "ser:   ", ser_read_accum);
+            log_frame("ser: read complete frame,", "ser:  ", ser_read_accum);
           }
           client_process_frame(ser_read_accum);
           // Reset state
@@ -246,8 +247,11 @@ void ser_decode_remaining(uint8_t *data, size_t size) {
     }
   }
 
+  assert(i == size);
+
   // Commit state
   ser_read_accum_esc = esc;
+  ser_read_accum->x.len = used;
   return;
 
 overrun:
@@ -269,11 +273,12 @@ bool ser_send(struct eth_packet *frame) {
     return false;
   }
 
+  assert(ip_validate_packet(frame, NULL));
+
   struct ip_packet *ip_frame = &frame->ip;
-  assert(ip_validate_packet(frame));
 
   if (log_client_outbound) {
-    log_frame("ser: writing frame,", "ser:   ", ser_read_accum);
+    log_frame("ser: writing frame,", "ser:  ", frame);
   }
 
   size_t size = ntohs(ip_frame->hdr.tot_len);
@@ -349,23 +354,26 @@ void ser_try_write_all_queued(void) {
     }
     // Our send buffer is empty, but there's stuff in the encode buffer --
     // swap buffers and let's go!
-    ser_send_tail = ser_encode_tail;
     ser_send_head = ser_encode_head;
+    ser_send_tail = ser_encode_tail;
+    ser_encode_head = 0;
+    ser_encode_tail = 0;
     ser_encode_index = !ser_encode_index;
   }
 
   if (ser_fd == -1) {
     // Woops, actually, we haven't been init'd properly
-    ser_encode_head = 0;
-    ser_encode_tail = 0;
+    ser_send_head = 0;
+    ser_send_tail = 0;
     return;
   }
 
   // Write the buffer to the serial port
   // The buffer we want is the one we're NOT encoding into
+  assert(ser_send_head > ser_send_tail);
   uint8_t *send_buf = ser_write_buf[!ser_encode_index];
   ssize_t amount = ser_send_head - ser_send_tail;
-  ssize_t result = write(ser_fd, send_buf + ser_encode_tail, (size_t)amount);
+  ssize_t result = write(ser_fd, send_buf + ser_send_tail, (size_t)amount);
 
   if (result < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {

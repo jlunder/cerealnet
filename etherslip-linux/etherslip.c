@@ -9,10 +9,20 @@ struct net_forward_queue_entry {
   time_ms_t submitted_ms;
 };
 
-bool recv_log = false;
-bool send_log = false;
-bool verbose_log = false;
-bool very_verbose_log = false;
+bool log_verbose = false;
+bool log_very_verbose = false;
+
+bool log_alloc = false;
+bool log_arp_cache = false;
+bool log_arp_states = false;
+bool log_arp_traffic = false;
+bool log_arp_usage = false;
+bool log_client_inbound = false;
+bool log_client_outbound = false;
+bool log_net_inbound = false;
+bool log_net_outbound = false;
+bool log_forwarding = false;
+bool log_dhcp_processing = false;
 
 uint32_t ser_bps = 115200;
 
@@ -36,6 +46,7 @@ struct ether_addr dhcp_last_chaddr = {{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
 struct eth_packet packet_pool[PACKET_POOL_SIZE];
 struct eth_packet *packet_pool_unallocated[PACKET_POOL_SIZE];
 size_t packet_pool_unallocated_count = 0;
+size_t next_tracking_id = 1;
 
 struct net_forward_queue_entry net_forward_queue[NET_FORWARD_QUEUE_SIZE];
 size_t net_forward_queue_tail = 0;
@@ -64,17 +75,27 @@ void parse_args(int argc, char *argv[]) {
 
   int opt;
   while ((opt = getopt(argc, argv,
-                       "s:"
+                       "s:i:n:g:"
 #if USE_IF_ETH
                        "Dpe:m:"
 #elif USE_IF_PKT
 #else
 #error "Must specify an interface type"
 #endif
-                       "RSvh")) != -1) {
+                       "L:vh")) != -1) {
     switch (opt) {
       case 's': {
         snprintf(ser_dev_name, PATH_MAX, "%s", optarg);
+      } break;
+
+      case 'i': {
+        // client IP
+      } break;
+      case 'n': {
+        // client network/netmask
+      } break;
+      case 'g': {
+        // gateway
       } break;
 
 #if USE_IF_ETH
@@ -84,6 +105,9 @@ void parse_args(int argc, char *argv[]) {
       case 'p': {
         break;
       }
+      case 'e': {
+        snprintf(net_if_name, IF_NAMESIZE, "%s", optarg);
+      } break;
       case 'm': {
         if (strcasecmp(optarg, "gen") == 0) {
           struct timespec ts;
@@ -107,27 +131,36 @@ void parse_args(int argc, char *argv[]) {
         }
         client_ready = true;
       } break;
-      case 'e': {
-        snprintf(net_if_name, IF_NAMESIZE, "%s", optarg);
-      } break;
 #elif USE_IF_PKT
 #else
 #error "Must specify an interface type"
 #endif
 
-      case 'R': {
-        recv_log = true;
-      } break;
-      case 'S': {
-        send_log = true;
+      case 'L': {
+        for (char const *p = optarg; *p; ++p) {
+          switch (*p) {
+              // clang-format off
+            case 'a': log_alloc = true; break;
+            case 'c': log_arp_cache = true; break;
+            case 's': log_arp_states = true; break;
+            case 't': log_arp_traffic = true; break;
+            case 'u': log_arp_usage = true; break;
+            case 'i': log_client_inbound = true; break;
+            case 'o': log_client_outbound = true; break;
+            case 'I': log_net_inbound = true; break;
+            case 'O': log_net_outbound = true; break;
+            case 'f': log_forwarding = true; break;
+            case 'd': log_dhcp_processing = true; break;
+              // clang-format on
+          }
+        }
       } break;
       case 'v': {
-        if (verbose_log) {
-          // logf("very verbose logging\n");
-          very_verbose_log = true;
+        if (log_verbose) {
+          logf("log: enabling very verbose logging\n");
+          log_very_verbose = true;
         } else {
-          // logf("verbose logging\n");
-          verbose_log = true;
+          log_verbose = true;
         }
       } break;
       case 'h': {
@@ -289,7 +322,7 @@ void poll_loop(void) {
       // Do ARP table cleanup
       arp_idle();
 
-      if ((keepalive_ms - now_ms > 2000) && verbose_log) {
+      if ((keepalive_ms - now_ms > 2000) && log_verbose) {
         keepalive_ms += 2000;
         logf("%lu: alive (%d)\n", (unsigned long)now_ms, poll_res);
       }
@@ -298,20 +331,21 @@ void poll_loop(void) {
 }
 
 void client_process_frame(struct eth_packet *frame) {
-  if (frame->len < sizeof(struct ethhdr)) {
+  if (frame->x.len < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
-    if (verbose_log && send_log) {
-      logf("client packet runt frame (%lu bytes)\n", (unsigned long)frame->len);
+    if (log_client_inbound) {
+      logf("client packet runt frame (%lu bytes)\n",
+           (unsigned long)frame->x.len);
     }
   } else
     // ip_validate_packet not ip_validate_frame, because the ethernet frame
     // is forged for client (SLIP) packets anyway
-    if (!ip_validate_packet(&frame->ip, ip_len(frame))) {
+    if (!ip_validate_packet(frame)) {
       // Ignore packet, not valid IP
-      if (verbose_log && send_log) {
-        logf("client packet not valid (%lu bytes):\n",
+      if (log_client_inbound) {
+        logf("client: packet not valid (%lu bytes)\n",
              (unsigned long)ip_len(frame));
-        hex_dump(stdlog, frame->ip.raw, ip_len(frame));
+        hex_dump(stdlog, "client:   ", frame->ip.raw, ip_len(frame));
       }
     } else if (net_forward_client_frame(frame)) {
       frame = NULL;
@@ -326,20 +360,10 @@ bool client_forward_net_frame(struct eth_packet *frame) {
   // Caller promises this is actually a valid IP packet
   assert(ip_validate_frame(frame));
 
-  // A complete packet and we're ready for it!
-  if (very_verbose_log && recv_log) {
-    logf(
-        "net packet ok, %lu bytes; hdr tot_len=%lu, proto=%02X, "
-        "sa=%s, ",
-        (unsigned long)frame->len, (unsigned long)ntohs(frame->ip.hdr.tot_len),
-        (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
-    logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
-  }
-
   if ((memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0) &&
       !ip_is_broadcast(ip_get_daddr(&frame->ip))) {
     // TODO permit network-local broadcast
-    if (verbose_log) {
+    if (log_forwarding) {
       logf(
           "client: sus packet with direct IP %s via broadcast MAC, not "
           "forwarding\n",
@@ -348,8 +372,9 @@ bool client_forward_net_frame(struct eth_packet *frame) {
     return false;
   }
 
+  // A complete packet and we're ready for it!
   if (frame->ip.hdr.protocol == IPPROTO_UDP) {
-    struct udphdr *udp = udp_parse_ip_packet(&frame->ip, ip_len(frame));
+    struct udphdr *udp = udp_parse_ip_packet(frame);
 
     if (udp && client_ready &&
         (memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) == 0)) {
@@ -357,25 +382,29 @@ bool client_forward_net_frame(struct eth_packet *frame) {
       struct dhcp_info info;
       struct dhcp_msg *dhcp = dhcp_parse_udp_packet(frame, &info);
       if (dhcp != NULL) {
-        if (verbose_log) {
+        if (log_dhcp_processing) {
           logf("client: snooping net DHCP; ");
           dhcp_dump_info_line(&info);
         }
 
         // Does this chaddr match the client's? I.e. should we convert back
-        if (memcmp(&dhcp->chaddr, &dhcp_last_chaddr, ETH_ALEN) == 0) {
+        if (memcmp(&dhcp->chaddr, &client_mac, ETH_ALEN) == 0) {
           if (info.is_ack && ip_is_this_host(client_ip)) {
             client_ip = info.yiaddr;
           }
           if (info.is_ack && ip_is_this_host(client_network)) {
-
             client_netmask = info.subnet_mask;
             client_network.s_addr = client_ip.s_addr & client_netmask.s_addr;
             client_gateway = info.router;
           }
 
+          if (log_dhcp_processing) {
+            logf("client: rewriting chaddr from %s ",
+                 ether_ntoa(&dhcp->chaddr));
+            logf("to %s\n", ether_ntoa(&dhcp_last_chaddr));
+          }
           // Rewrite client MAC address in packet
-          memcpy(&dhcp->chaddr, &client_mac, ETH_ALEN);
+          memcpy(&dhcp->chaddr, &dhcp_last_chaddr, ETH_ALEN);
           udp->check = htons(0);
           udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
         }
@@ -384,7 +413,6 @@ bool client_forward_net_frame(struct eth_packet *frame) {
   }
 
   // TODO rewrite IP addresses for masquerading if needed
-  // TODO filter in only IP packets actually sent to the client
 
   // Pass frame on to serial send
   ser_send(frame);
@@ -392,15 +420,12 @@ bool client_forward_net_frame(struct eth_packet *frame) {
 }
 
 void net_process_frame(struct eth_packet *frame) {
-  if (frame->len < sizeof(struct ethhdr)) {
+  if (frame->x.len < sizeof(struct ethhdr)) {
     // Runt ethernet frame? Not long enough for MAC??
-    if (verbose_log && recv_log) {
-      logf("net packet runt frame (%lu bytes)\n", (unsigned long)frame->len);
+    if (log_verbose) {
+      logf("net: runt frame (%lu bytes), tid %lu\n",
+           (unsigned long)frame->x.len, (unsigned long)frame->x.tracking_id);
     }
-  } else if (frame->len > MAX_PACKET_SIZE) {
-    // Ignore packet, too big (extra jumbo frame? We can't handle it)
-    logf("net packet too big (trucated to %lu of %lu bytes)\n",
-         (unsigned long)(MAX_PACKET_SIZE), (unsigned long)frame->len);
   } else if (arp_process_frame(frame)) {
     frame = NULL;
   } else if (ip_validate_frame(frame)) {
@@ -411,27 +436,33 @@ void net_process_frame(struct eth_packet *frame) {
          memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) != 0) &&
         (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) != 0)) {
       // TODO multicast support? Not sure how this works
-      if (very_verbose_log && recv_log) {
-        logf("net packet for another host (%s)\n",
-             ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest));
+      if (log_forwarding && log_very_verbose) {
+        logf("net: packet for another host (%s), tid %lu\n",
+             ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest),
+             (unsigned long)frame->x.tracking_id);
       }
     } else {
 #endif
-      if (client_ready && client_forward_net_frame(frame)) {
-        frame = NULL;
+      if (client_ready) {
+        if (log_forwarding) {
+          logf("net: attempting to forward to client, tid %lu\n",
+               (unsigned long)frame->x.tracking_id);
+        }
+        if (client_forward_net_frame(frame)) {
+          frame = NULL;
+        }
       }
 #if USE_IF_ETH
     }
 #endif
   } else {
     // Ignore packet: it's not valid IP
-    if (very_verbose_log && recv_log) {
+    if (log_forwarding && log_very_verbose) {
       if ((client_ready &&
            memcmp(&frame->hdr.h_dest, &client_mac, ETH_ALEN) == 0) ||
           (memcmp(&frame->hdr.h_dest, &broadcast_mac, ETH_ALEN) == 0)) {
-        logf("net packet not recognized (%lu bytes):\n",
-             (unsigned long)frame->len);
-        hex_dump(stdlog, &frame->raw, frame->len);
+        logf("net: packet not valid IP, tid %lu\n", (unsigned long)frame->x.len,
+             (unsigned long)frame->x.tracking_id);
       }
     }
   }
@@ -442,21 +473,10 @@ void net_process_frame(struct eth_packet *frame) {
 }
 
 bool net_forward_client_frame(struct eth_packet *frame) {
-  if (very_verbose_log && send_log) {
-    logf(
-        "client packet ok, %lu bytes; hdr tot_len=%lu, proto=%d, "
-        "sa=%s, ",
-        (unsigned long)ip_len(frame),
-        (unsigned long)ntohs(frame->ip.hdr.tot_len),
-        (int)frame->ip.hdr.protocol, inet_ntoa(ip_get_saddr(&frame->ip)));
-    logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
-    hex_dump(stdlog, frame->raw, frame->len);
-  }
-
-  assert(ip_validate_packet(&frame->ip, ip_len(frame)));
+  assert(ip_validate_packet(frame));
 
   if (ip_is_this_host(client_ip) && ip_is_proper(ip_get_saddr(&frame->ip))) {
-    if (verbose_log) {
+    if (log_forwarding && log_verbose) {
       logf("net: updating client IP from %s", inet_ntoa(client_ip));
       logf(" to %s (snooped outgoing)\n",
            inet_ntoa(*(struct in_addr *)&frame->ip.hdr.saddr));
@@ -465,7 +485,7 @@ bool net_forward_client_frame(struct eth_packet *frame) {
   }
 
   if (frame->ip.hdr.protocol == IPPROTO_UDP) {
-    struct udphdr *udp = udp_parse_ip_packet(&frame->ip, ip_len(frame));
+    struct udphdr *udp = udp_parse_ip_packet(frame);
 
     if (udp != NULL) {
       // Snoop/masquerade DHCP
@@ -490,7 +510,7 @@ bool net_forward_client_frame(struct eth_packet *frame) {
           }
         }
 
-        if (verbose_log && !ip_equals(client_ip, dhcp->ciaddr)) {
+        if (log_dhcp_processing && !ip_equals(client_ip, dhcp->ciaddr)) {
           logf("net: client supplied suspicious ciaddr %s",
                inet_ntoa(dhcp->ciaddr));
           logf("in snooped DHCP, expected %s\n", inet_ntoa(client_ip));
@@ -501,7 +521,7 @@ bool net_forward_client_frame(struct eth_packet *frame) {
         udp->check = htons(0);
         udp->check = udp_checksum(&frame->ip, ntohs(udp->len));
 
-        if (verbose_log) {
+        if (log_dhcp_processing) {
           // Re-parse
           dhcp = dhcp_parse_udp_packet(frame, &info);
           logf("net: snooping client DHCP; ");
@@ -513,12 +533,16 @@ bool net_forward_client_frame(struct eth_packet *frame) {
 
   struct in_addr dest_ip = ip_get_daddr(&frame->ip);
   if (!ip_is_proper_or_broadcast(dest_ip)) {
-    if (verbose_log) {
+    if (log_forwarding) {
       logf("net: client packet with improper destination %s, not forwarding\n",
            inet_ntoa(dest_ip));
     }
     return false;
   }
+
+  // Fill out info we definitely have
+  frame->hdr.h_proto = htons(ETH_P_IP);
+  *(struct ether_addr *)&frame->hdr.h_source = client_mac;
 
   // This should have been reset, it's actually critical in order for the ARP
   // request to be checked/retried later
@@ -543,7 +567,7 @@ bool net_forward_client_frame(struct eth_packet *frame) {
   }
 
   if (net_forward_queue[net_forward_queue_tail].frame != NULL) {
-    if (verbose_log) {
+    if (log_forwarding || log_verbose) {
       logf("net: forward queue full, not forwarding\n");
     }
     return false;
@@ -558,10 +582,6 @@ bool net_forward_client_frame(struct eth_packet *frame) {
 
 bool net_send_link_frame(struct eth_packet *frame) {
 #if USE_IF_ETH
-  // Fill out info we definitely have
-  frame->hdr.h_proto = htons(ETH_P_IP);
-  *(struct ether_addr *)&frame->hdr.h_source = client_mac;
-
   return eth_send(frame);
 #elif USE_IF_PKT
   return pkt_send(frame);
@@ -571,6 +591,11 @@ bool net_send_link_frame(struct eth_packet *frame) {
 }
 
 void net_process_queued(void) {
+  if (log_forwarding && log_very_verbose && (net_forward_queue_count > 0)) {
+    logf("net: trying to send %lu queued packets\n",
+         (unsigned long)net_forward_queue_count);
+  }
+
   net_forward_queue_count = 0;
 
   for (size_t i = 0; i < NET_FORWARD_QUEUE_SIZE; ++i) {
@@ -582,6 +607,10 @@ void net_process_queued(void) {
     }
 
     if (time_since_ms(now_ms, entry->submitted_ms) > 5000UL) {
+      if (log_forwarding || log_verbose) {
+        logf("net: ageing out packet tid %lu, unable to send\n",
+             (unsigned long)entry->frame->x.tracking_id);
+      }
       // Aged out
       free_packet_buf(entry->frame);
       entry->frame = NULL;
@@ -615,15 +644,21 @@ struct eth_packet *alloc_packet_buf(void) {
     struct eth_packet *result =
         packet_pool_unallocated[packet_pool_unallocated_count];
     assert(result != NULL);
+    assert(result->x.tracking_id == 0);
     packet_pool_unallocated[packet_pool_unallocated_count] = NULL;
-    // if (very_verbose_log) {
-    //   logf("alloc buf, %lu available\n",
-    //        (unsigned long)packet_pool_unallocated_count);
-    // }
+    result->x.tracking_id = next_tracking_id++;
+
+    if (log_alloc) {
+      logf("alloc: alloc buf #%lu, tid %lu, %lu available\n",
+           (unsigned long)(result - packet_pool),
+           (unsigned long)result->x.tracking_id,
+           (unsigned long)packet_pool_unallocated_count);
+    }
+
     return result;
   } else {
-    if (very_verbose_log) {
-      logf("alloc buf fail, none available\n");
+    if (log_alloc) {
+      logf("alloc: alloc requested but no buffers are available\n");
     }
     return NULL;
   }
@@ -632,15 +667,37 @@ struct eth_packet *alloc_packet_buf(void) {
 void free_packet_buf(struct eth_packet *packet) {
   assert(packet != NULL);
   assert(packet_pool_unallocated_count < PACKET_POOL_SIZE);
+  assert(packet->x.tracking_id != 0);
+
+  if (log_alloc) {
+    logf("alloc: free buf #%lu, tid %lu, %lu available\n",
+         (unsigned long)(packet - packet_pool),
+         (unsigned long)packet->x.tracking_id,
+         (unsigned long)(packet_pool_unallocated_count + 1));
+  }
+
+  packet->x.tracking_id = 0;
   packet_pool_unallocated[packet_pool_unallocated_count] = packet;
   ++packet_pool_unallocated_count;
-  // if (very_verbose_log) {
-  //   logf("free buf, %lu available\n",
-  //        (unsigned long)packet_pool_unallocated_count);
-  // }
 }
 
-void hex_dump(FILE *f, void const *buf, size_t size) {
+void log_frame(char const *msg, char const *prefix, struct eth_packet *frame) {
+  logf("%s tid %lu, %lu bytes, src mac=%s, ", msg,
+       (unsigned long)frame->x.tracking_id, (unsigned long)frame->x.len,
+       ether_ntoa((struct ether_addr const *)&frame->hdr.h_dest));
+  logf("dest mac=%s, eth proto=%04X; ",
+       ether_ntoa((struct ether_addr const *)&frame->hdr.h_source),
+       (unsigned)ntohs(frame->hdr.h_proto));
+  logf("hdr tot_len=%lu, proto=%d, sa=%s, ",
+       (unsigned long)ntohs(frame->ip.hdr.tot_len), (int)frame->ip.hdr.protocol,
+       inet_ntoa(ip_get_saddr(&frame->ip)));
+  logf("da=%s\n", inet_ntoa(ip_get_daddr(&frame->ip)));
+  if (log_very_verbose) {
+    hex_dump(stdlog, prefix, frame->raw, frame->x.len);
+  }
+}
+
+void hex_dump(FILE *f, char const *prefix, void const *buf, size_t size) {
   static char const hex_chars[] = "0123456789ABCDEF";
   char line[128];
   size_t k;
@@ -672,6 +729,6 @@ void hex_dump(FILE *f, void const *buf, size_t size) {
     line[k++] = '|';
     line[k++] = '\n';
     line[k++] = '\0';
-    fputs(line, f);
+    fprintf(f, "%s%s", prefix, line);
   }
 }

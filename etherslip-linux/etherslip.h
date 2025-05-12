@@ -76,7 +76,7 @@
 #define IS_POW2(x) (((x - 1) | ((x - 1) >> 1)) == (x - 1))
 
 // big enough for a 9k jumbo frame
-#define MAX_PACKET_SIZE (1024 * 10 - sizeof(size_t))
+#define MAX_PACKET_SIZE (1024 * 10 - sizeof(struct eth_extras))
 #define PACKET_POOL_SIZE 8
 
 static_assert(IS_POW2(PACKET_POOL_SIZE));
@@ -117,6 +117,11 @@ static_assert(IS_POW2(PACKET_POOL_SIZE));
 
 // clang-format on
 
+struct eth_extras {
+  size_t tracking_id;
+  size_t len;
+};
+
 struct dhcp_msg {
   uint8_t op;
   uint8_t htype;
@@ -153,7 +158,7 @@ struct eth_packet {
     } __attribute__((packed));
     uint8_t raw[MAX_PACKET_SIZE];
   };
-  size_t len;
+  struct eth_extras x;
 } __attribute__((packed));
 
 static_assert(sizeof(struct ethhdr) == ETH_HLEN);
@@ -182,10 +187,20 @@ struct dhcp_info {
 
 typedef uint32_t time_ms_t;
 
-extern bool recv_log;
-extern bool send_log;
-extern bool verbose_log;
-extern bool very_verbose_log;
+extern bool log_verbose;
+extern bool log_very_verbose;
+
+extern bool log_alloc;
+extern bool log_arp_cache;
+extern bool log_arp_states;
+extern bool log_arp_traffic;
+extern bool log_arp_usage;
+extern bool log_client_inbound;
+extern bool log_client_outbound;
+extern bool log_net_inbound;
+extern bool log_net_outbound;
+extern bool log_forwarding;
+extern bool log_dhcp_processing;
 
 extern uint32_t ser_bps;
 
@@ -215,7 +230,6 @@ extern size_t packet_pool_unallocated_count;
 void ser_init(char const *ser_dev_name);
 void ser_setup_pollfd(struct pollfd *pfd);
 void ser_read_available(void);
-void ser_accumulate_bytes(uint8_t *data, size_t size);
 bool ser_send(struct eth_packet *frame);
 bool ser_has_work(void);
 void ser_try_write_all_queued(void);
@@ -262,21 +276,20 @@ void arp_idle(void);
 
 struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
                                        struct dhcp_info *out_info);
-bool dhcp_parse_options(uint8_t const *opts, size_t len,
-                        struct dhcp_info *out_info);
+uint16_t udp_checksum(struct ip_packet const *ip_frame, size_t udp_size);
 void dhcp_dump_info_line(struct dhcp_info const *info);
 
 // proto_ip
 
-struct udphdr *udp_parse_ip_packet(struct ip_packet *ip_frame, size_t len);
+struct udphdr *udp_parse_ip_packet(struct eth_packet *frame);
 
 bool ip_validate_frame(struct eth_packet const *frame);
-bool ip_validate_packet(struct ip_packet const *ip_frame, size_t size);
+bool ip_validate_packet(struct eth_packet const *frame);
 uint16_t ip_header_checksum(struct ip_packet const *ip_frame,
                             size_t header_size);
 
 static inline size_t ip_len(struct eth_packet const *frame) {
-  return frame->len - sizeof(struct ethhdr);
+  return frame->x.len - sizeof(struct ethhdr);
 }
 
 static inline struct in_addr ip_get_daddr(struct ip_packet const *ip_frame) {
@@ -362,6 +375,10 @@ static inline bool eth_is_proper_mac(struct ether_addr mac_addr) {
          (memcmp(&mac_addr, &broadcast_mac, ETH_ALEN) != 0);
 }
 
+void log_frame(char const *msg, char const *prefix, struct eth_packet *frame);
+
+void hex_dump(FILE *f, char const *prefix, void const *buf, size_t size);
+
 // etherslip
 
 void parse_args(int argc, char *argv[]);
@@ -389,7 +406,5 @@ bool net_waiting(void);
 
 struct eth_packet *alloc_packet_buf(void);
 void free_packet_buf(struct eth_packet *packet);
-
-void hex_dump(FILE *f, void const *buf, size_t size);
 
 #endif  // ETHERSLIP_H_INCLUDED

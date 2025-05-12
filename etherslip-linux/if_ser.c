@@ -5,17 +5,32 @@
 #define SER_WRITE_QUEUE_SIZE MAX_SLIP_EXPANSION(MAX_PACKET_SIZE)
 
 struct eth_packet *ser_read_accum = NULL;
-size_t ser_read_accum_used = 0;
 bool ser_read_accum_esc = false;
+bool ser_read_discarding = false;
 
-uint8_t ser_write_buf[SER_WRITE_QUEUE_SIZE];
-size_t ser_write_buf_head = 0;
-size_t ser_write_buf_tail = 0;
+// There are two write buffers exactly, because we want one to encode into while
+// the other is sending. This shouldn't in theory help *much*, but it should
+// allow us to cover small pipeline gaps where we don't start encoding the next
+// packet until after the previous one finishes writing. This way there's at
+// least one more packet ready to go immediately, and then we can encode the
+// subsequent one while it's transmitting.
+
+// In practice probably there's enough serial send buffer in the kernel to cover
+// this situation on any Linux host, but if we target embedded it could matter.
+
+uint8_t ser_write_buf[2][SER_WRITE_QUEUE_SIZE];
+
+size_t ser_encode_index = 0;
+
+size_t ser_encode_head = 0;
+size_t ser_encode_tail = 0;
 
 size_t ser_send_head = 0;
 size_t ser_send_tail = 0;
 
 int ser_fd;
+
+size_t ser_accumulate_bytes(uint8_t *data, size_t size);
 
 void ser_init(char const *ser_dev_name) {
   // TODO enumerate serial devices
@@ -60,7 +75,7 @@ void ser_init(char const *ser_dev_name) {
 void ser_setup_pollfd(struct pollfd *pfd) {
   pfd->fd = ser_fd;
   pfd->events = POLLIN;
-  if (ser_write_buf_head != ser_write_buf_tail) {
+  if (ser_send_head != ser_send_tail) {
     pfd->events |= POLLOUT;
   }
   pfd->revents = 0;
@@ -70,61 +85,85 @@ void ser_read_available(void) {
   uint8_t read_buf[512];
   ssize_t res;
 
-  if (ser_read_accum == NULL) {
-    ser_read_accum = alloc_packet_buf();
-    if (ser_read_accum == NULL) {
-      // too many outbound packets queued?
-      return;
-    }
-    memset(&ser_read_accum->hdr, 0, sizeof ser_read_accum->hdr);
-  }
-
   do {
     res = read(ser_fd, read_buf, sizeof read_buf);
     if (res < 0) {
       if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
         res = 0;
       } else {
-        perror("read() failed for serial socket");
+        perror("ser: read() failed for serial socket");
         exit(1);
       }
     }
 
     if ((size_t)res > sizeof read_buf) {
-      logf("read() returned bad size %lu > %lu", (unsigned long)res,
+      logf("ser: read() returned bad size %lu > %lu", (unsigned long)res,
            (unsigned long)sizeof read_buf);
       exit(1);
     }
 
-    ser_accumulate_bytes(read_buf, (size_t)res);
+    ser_decode_remaining(read_buf, (size_t)res);
   } while (res == sizeof read_buf);
 }
 
-void ser_accumulate_bytes(uint8_t *data, size_t size) {
+void ser_decode_remaining(uint8_t *data, size_t size) {
+  size_t i = 0;
+
+  // Discard the remainder of the packet if we're supposed to do that
+  if (ser_read_discarding) {
+    // Reset the buffer if we have already allocated one
+    if (ser_read_accum != NULL) {
+      ser_read_accum->x.len = 0;
+    }
+    // Consume input until end-of-packet
+    while ((i < size) && (data[i] != SLIP_END)) ++i;
+    ser_read_accum_esc = false;
+    ser_read_discarding = false;
+    // And continue on with normal processing!
+  }
+
+  // Prepare the packet buffer we'll be accumulating into, if we don't already
+  // have one set up
+  if (ser_read_accum == NULL) {
+    ser_read_accum = alloc_packet_buf();
+    if (ser_read_accum == NULL) {
+      if (log_verbose) {
+        logf("ser: packet alloc fail in ser_decode\n");
+      }
+      return;
+    }
+    memset(&ser_read_accum->hdr, 0, sizeof ser_read_accum->hdr);
+    ser_read_accum->x.len = 0;
+  }
+
   // Cache in local vars
-  size_t used = ser_read_accum_used;
+  size_t used = ser_read_accum->x.len;
   bool esc = ser_read_accum_esc;
+  uint8_t *decode_buf = ser_read_accum->ip.raw;
 
   // Sit in a loop reading bytes until we put together a whole packet. Make sure
   // not to copy them into the packet if we run out of room.
-  size_t i = 0;
   while (i < size) {
+    if (used >= sizeof ser_read_accum->ip.raw) {
+      goto overrun;
+    }
+
     // If the last character was ESC, apply special processing to this one
     if (esc) {
       uint8_t c = data[i++];
       assert(used < sizeof ser_read_accum->ip.raw);
       switch (c) {
         case SLIP_ESC_END: {
-          ser_read_accum->ip.raw[used++] = SLIP_END;
+          decode_buf[used++] = SLIP_END;
         } break;
         case SLIP_ESC_ESC: {
-          ser_read_accum->ip.raw[used++] = SLIP_ESC;
+          decode_buf[used++] = SLIP_ESC;
         } break;
         // If "c" is not one of these two, then we have a protocol violation.
         // The best bet seems to be to leave the byte alone and just stuff it
         // into the packet.
         default: {
-          ser_read_accum->ip.raw[used++] = c;
+          decode_buf[used++] = c;
         } break;
       }
       esc = false;
@@ -137,6 +176,9 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
     // Consume as many non-special bytes as possible
     size_t j = i;
     while ((j < size) && (data[j] != SLIP_END) && (data[j] != SLIP_ESC)) {
+      if (used + j - i >= sizeof ser_read_accum->ip.raw) {
+        goto overrun;
+      }
       ++j;
     }
     // Any found?
@@ -144,7 +186,7 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
       size_t amount = j - i;
       assert(used + amount <= sizeof ser_read_accum->ip.raw);
       // Copy the entire block of non-special bytes at once
-      memcpy(ser_read_accum->ip.raw + used, data + i, amount);
+      memcpy(decode_buf + used, data + i, amount);
       used += amount;
       i = j;
       // Stop if we've emptied the input buffer
@@ -163,13 +205,30 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
         if (used == 0) {
           // Ignore silently, probably just a spacer put in by the client to
           // increase noise resistance
-          if (very_verbose_log) {
-            logf("ser ignoring zero-length\n");
+          if (log_very_verbose) {
+            logf("ser: ignoring zero-length\n");
           }
+          // In this case, we haven't actually started processing, so it's safe
+          // to continue with state as-is
         } else {
-          ser_read_accum->len = sizeof(struct ethhdr) + used;
+          if (log_verbose && esc) {
+            logf(
+                "ser: SLIP decoding error, packet from client ends mid-escape");
+          }
+          ser_read_accum->x.len = sizeof(struct ethhdr) + used;
+          if (log_client_inbound) {
+            log_frame("ser: read complete frame,", "ser:   ", ser_read_accum);
+          }
           client_process_frame(ser_read_accum);
+          // Reset state
           ser_read_accum = NULL;
+          ser_read_accum_esc = false;
+          assert(!ser_read_discarding);
+          // Recurse to process any further data
+          if (i < size) {
+            ser_decode(data + i, size - i);
+          }
+          return;
         }
         // Packet has either been discarded or processed, start a new one
         used = 0;
@@ -187,34 +246,45 @@ void ser_accumulate_bytes(uint8_t *data, size_t size) {
     }
   }
 
-  // Commit to statics
-  ser_read_accum_used = used;
+  // Commit state
   ser_read_accum_esc = esc;
+  return;
+
+overrun:
+  if (log_verbose) {
+    logf("ser: SLIP decoding error, packet overran max size\n");
+  }
+  // Flag that we're supposed to discard the remainder
+  ser_read_discarding = true;
+  // Recurse to restart processing
+  ser_decode(data + i, size - i);
 }
 
 bool ser_send(struct eth_packet *frame) {
   assert(frame != NULL);
 
-  if (ser_write_buf_tail != 0) {
+  if (ser_encode_tail != 0) {
+    // We have encoded data waiting to write already, no sense in trying to
+    // queue more right now, just tell the higher layer we're full up
     return false;
   }
 
   struct ip_packet *ip_frame = &frame->ip;
-  assert(ip_validate_packet(ip_frame, ip_len(frame)));
+  assert(ip_validate_packet(frame));
 
-  if (very_verbose_log && recv_log) {
-    logf("ser_send packet:\n");
-    hex_dump(stdlog, ip_frame, ntohs(ip_frame->hdr.tot_len));
+  if (log_client_outbound) {
+    log_frame("ser: writing frame,", "ser:   ", ser_read_accum);
   }
 
   size_t size = ntohs(ip_frame->hdr.tot_len);
+  uint8_t *encode_buf = ser_write_buf[ser_encode_index];
   // For each byte in the packet, send the appropriate character sequence
   size_t i = 0;
   size_t j = 0;
   assert(j + 1 <= SER_WRITE_QUEUE_SIZE);
   // Send an initial END character to flush out any data that may have
   // accumulated in the receiver due to line noise
-  ser_write_buf[j++] = SLIP_END;
+  encode_buf[j++] = SLIP_END;
   while (i < size) {
     uint8_t c = ip_frame->raw[i];
     switch (c) {
@@ -222,17 +292,17 @@ bool ser_send(struct eth_packet *frame) {
       // character code so as not to make the receiver think we sent an END
       case SLIP_END: {
         assert(j + 2 <= SER_WRITE_QUEUE_SIZE);
-        ser_write_buf[j++] = SLIP_ESC;
-        ser_write_buf[j++] = SLIP_ESC_END;
+        encode_buf[j++] = SLIP_ESC;
+        encode_buf[j++] = SLIP_ESC_END;
         ++i;
       } break;
 
       // If it's the same code as an ESC character, we send a special two
-      // character code so as not to make the receiver think we sent an ESC
+      // character code that disambiguates from END escape
       case SLIP_ESC: {
         assert(j + 2 <= SER_WRITE_QUEUE_SIZE);
-        ser_write_buf[j++] = SLIP_ESC;
-        ser_write_buf[j++] = SLIP_ESC_ESC;
+        encode_buf[j++] = SLIP_ESC;
+        encode_buf[j++] = SLIP_ESC_ESC;
         ++i;
       } break;
 
@@ -247,58 +317,70 @@ bool ser_send(struct eth_packet *frame) {
         }
         size_t amount = k - i;
         assert(j + amount <= SER_WRITE_QUEUE_SIZE);
-        memcpy(ser_write_buf + j, ip_frame->raw + i, amount);
+        memcpy(encode_buf + j, ip_frame->raw + i, amount);
         i = k;
         j += amount;
       } break;
     }
   }
   assert(j + 1 <= SER_WRITE_QUEUE_SIZE);
-  ser_write_buf[j++] = SLIP_END;
+  encode_buf[j++] = SLIP_END;
 
-  ser_write_buf_tail = 0;
-  ser_write_buf_head = j;
+  ser_encode_tail = 0;
+  ser_encode_head = j;
 
   free_packet_buf(frame);
 
-  // logf("SLIP encoded:\n");
-  // hex_dump(stdlog, ser_write_buf, j);
   ser_try_write_all_queued();
 
   return true;
 }
 
 bool ser_has_work(void) {
-  return ser_write_buf_tail != ser_write_buf_head;
+  return (ser_encode_tail != ser_encode_head) ||
+         (ser_send_tail != ser_send_head);
 }
 
 void ser_try_write_all_queued(void) {
-  if (ser_write_buf_tail == ser_write_buf_head) {
-    return;
+  if (ser_send_tail == ser_send_head) {
+    if (ser_encode_tail == ser_encode_head) {
+      // Nothing to do, bail early
+      return;
+    }
+    // Our send buffer is empty, but there's stuff in the encode buffer --
+    // swap buffers and let's go!
+    ser_send_tail = ser_encode_tail;
+    ser_send_head = ser_encode_head;
+    ser_encode_index = !ser_encode_index;
   }
 
   if (ser_fd == -1) {
-    ser_write_buf_head = 0;
-    ser_write_buf_tail = 0;
+    // Woops, actually, we haven't been init'd properly
+    ser_encode_head = 0;
+    ser_encode_tail = 0;
     return;
   }
 
   // Write the buffer to the serial port
-  ssize_t amount = ser_write_buf_head - ser_write_buf_tail;
-  ssize_t result =
-      write(ser_fd, ser_write_buf + ser_write_buf_tail, (size_t)amount);
+  // The buffer we want is the one we're NOT encoding into
+  uint8_t *send_buf = ser_write_buf[!ser_encode_index];
+  ssize_t amount = ser_send_head - ser_send_tail;
+  ssize_t result = write(ser_fd, send_buf + ser_encode_tail, (size_t)amount);
 
   if (result < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+      // Try again, but later
       return;
     }
     perror("write to ser failed");
-    ser_write_buf_head = 0;
-    ser_write_buf_tail = 0;
+    ser_send_head = 0;
+    ser_send_tail = 0;
   } else if (result == amount) {
-    ser_write_buf_head = 0;
-    ser_write_buf_tail = 0;
+    ser_send_head = 0;
+    ser_send_tail = 0;
+    // Try to send more right now
+    ser_try_write_all_queued();
   } else {
-    ser_write_buf_tail += result;
+    ser_send_tail += result;
   }
 }

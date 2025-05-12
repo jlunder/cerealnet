@@ -1,5 +1,8 @@
 #include "etherslip.h"
 
+bool dhcp_parse_options(uint8_t const *opts, size_t len,
+                        struct dhcp_info *out_info);
+
 struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
                                        struct dhcp_info *out_info) {
   assert(out_info != NULL);
@@ -36,7 +39,7 @@ struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
     out_info->server_ip = ip_get_saddr(&frame->ip);
   } else {
     // Probably not BOOTP/DHCP at all
-    if (very_verbose_log) {
+    if (log_very_verbose) {
       logf("dhcp_parse: ignoring packet from source port %u to dest port %u\n",
            (unsigned short)ntohs(udp->source),
            (unsigned short)ntohs(udp->dest));
@@ -45,7 +48,7 @@ struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
   }
 
   if (ntohs(udp->len) < offsetof(struct dhcp_msg, options) + 4) {
-    if (verbose_log) {
+    if (log_verbose) {
       logf("dhcp_parse: truncated datagram, %d\n", (int)ntohs(udp->len));
     }
     return NULL;
@@ -55,14 +58,14 @@ struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
       (struct dhcp_msg *)&frame->ip.raw[header_len + sizeof(struct udphdr)];
 
   if ((dhcp->htype != ARPHRD_ETHER) || (dhcp->hlen != ETH_ALEN)) {
-    if (verbose_log) {
+    if (log_verbose) {
       logf("dhcp_parse: invalid htype/hlen %d/%d\n", (int)dhcp->htype,
            (int)dhcp->hlen);
     }
     return NULL;
   }
   if (ntohl(*(uint32_t *)dhcp->options) != 0x63825363) {
-    if (verbose_log) {
+    if (log_verbose) {
       logf("dhcp_parse: invalid options magic %08lX\n",
            (unsigned long)*(uint32_t *)dhcp->options);
     }
@@ -79,7 +82,7 @@ struct dhcp_msg *dhcp_parse_udp_packet(struct eth_packet *frame,
   } else if (dhcp->op == 2) {
     out_info->bootp_request = false;
   } else {
-    if (verbose_log) {
+    if (log_verbose) {
       logf("dhcp_parse: invalid bootp op %d\n", (int)dhcp->op);
     }
     return NULL;
@@ -115,7 +118,7 @@ bool dhcp_parse_options(uint8_t const *opts, size_t len,
       break;
     }
     if (i >= len) {
-      if (verbose_log) {
+      if (log_verbose) {
         logf("dhcp_parse: option %d overruns buffer at %d/%d\n", (int)optcode,
              (int)(i - 1), (int)len);
       }
@@ -123,7 +126,7 @@ bool dhcp_parse_options(uint8_t const *opts, size_t len,
     }
     uint8_t optlen = opts[i++];
     if (i + optlen > len) {
-      if (verbose_log) {
+      if (log_verbose) {
         logf("dhcp_parse: option %d with length %d overruns buffer at %d/%d\n",
              (int)optcode, (int)optlen, (int)(i - 2), (int)len);
       }
@@ -146,7 +149,7 @@ bool dhcp_parse_options(uint8_t const *opts, size_t len,
       case 52: {  // Options overload (parse extra opts in file/sname fields)
         if (optlen != 1) return false;
         if (opts[i] < 1 || opts[i] > 3) {
-          if (verbose_log) {
+          if (log_verbose) {
             logf(
                 "dhcp_parse: invalid option 52 (Option Overload), %d at "
                 "%d/%d\n",
@@ -164,7 +167,7 @@ bool dhcp_parse_options(uint8_t const *opts, size_t len,
       case 53: {  // Message type
         if (optlen != 1) return false;
         if (opts[i] < 1 || opts[i] > 8) {
-          if (verbose_log) {
+          if (log_verbose) {
             logf(
                 "dhcp_parse: invalid option 53 (DHCP Message Type), %d at "
                 "%d/%d\n",
@@ -184,7 +187,7 @@ bool dhcp_parse_options(uint8_t const *opts, size_t len,
     }
     i += optlen;
   }
-  if (!proper_termination && verbose_log) {
+  if (!proper_termination && log_verbose) {
     logf("dhcp_parse: options not properly terminated, at %d\n", (int)len);
   }
   return true;
@@ -215,21 +218,4 @@ void dhcp_dump_info_line(struct dhcp_info const *info) {
     logf(" ACK");
   }
   logf("\n");
-}
-
-bool ip_validate_frame(struct eth_packet const *frame) {
-  uint16_t proto = ntohs(frame->hdr.h_proto);
-
-  if (frame->len < sizeof(struct ethhdr)) {
-    return false;
-  }
-  if (proto < ETH_P_802_3_MIN) {
-    // size = proto;
-    // proto = ETH_P_802_3;
-    return false;
-  }
-  if (proto != ETH_P_IP) {
-    return false;
-  }
-  return ip_validate_packet(&frame->ip, ip_len(frame));
 }

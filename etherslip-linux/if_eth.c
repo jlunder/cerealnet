@@ -11,13 +11,13 @@ void eth_init(char const *if_name) {
   // Create a raw socket
   eth_socket = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
   if (eth_socket < 0) {
-    perror("socket() failed for ethernet socket");
+    perror("eth: socket() failed for ethernet socket");
     exit(1);
   }
 
   struct ifreq ioc_req;
   if (*if_name == '\0') {
-    if (verbose_log) {
+    if (log_verbose) {
       logf("eth: no interface specified, scanning\n");
     }
 
@@ -27,16 +27,16 @@ void eth_init(char const *if_name) {
       if (ioctl(eth_socket, SIOCGIFNAME, &ioc_req) < 0) {
         goto autoconf_fail;
       }
-      if (verbose_log) {
+      if (log_verbose) {
         logf("eth: found interface at index %d: %s\n", i, ioc_req.ifr_name);
       }
       if (ioctl(eth_socket, SIOCGIFFLAGS, &ioc_req) < 0) {
-        if (very_verbose_log) {
+        if (log_very_verbose) {
           logf("eth: couldn't get flags for interface %s\n", ioc_req.ifr_name);
           continue;
         }
       }
-      if (very_verbose_log) {
+      if (log_very_verbose) {
         logf("eth: interface %s flags =%s%s%s\n", ioc_req.ifr_name,
              ioc_req.ifr_flags & IFF_UP ? " UP" : " DOWN",
              ioc_req.ifr_flags & IFF_LOOPBACK ? " LOOPBACK" : "",
@@ -108,7 +108,9 @@ void eth_read_available(void) {
   // at reading/processing a single packet
   struct eth_packet *frame = alloc_packet_buf();
   if (frame == NULL) {
-    logf("eth packet alloc failed!\n");
+    if (log_verbose) {
+      logf("eth: packet alloc fail in eth_read_available\n");
+    }
     return;
   }
 
@@ -120,13 +122,21 @@ void eth_read_available(void) {
   if (recv_size < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
       // No message waiting after all
+      free_packet_buf(frame);
+      return;
     } else {
-      perror("recvfrom failed");
+      perror("eth: recvfrom() failed");
       exit(1);
     }
-    free_packet_buf(frame);
   } else {
-    frame->len = (size_t)recv_size;
+    if(recv_size > MAX_PACKET_SIZE) {
+      logf("eth: recvfrom() returned unbelievable size %lu\n", (unsigned long)recv_size);
+      exit(1);
+    }
+    frame->x.len = (size_t)recv_size;
+    if (log_net_inbound) {
+      log_frame("eth: read frame,", "eth:   ", frame);
+    }
     net_process_frame(frame);
   }
 }
@@ -140,8 +150,8 @@ bool eth_send(struct eth_packet *frame) {
 
   if (!client_ready) {
     // We need a MAC address to send, but if we're not ready it's uninitialized
-    if (verbose_log) {
-      logf("eth: client sending while not ready, dropping packet\n");
+    if (log_net_outbound || log_verbose) {
+      logf("eth: client trying to send while not ready, dropping packet\n");
     }
     free_packet_buf(frame);
     return true;
@@ -164,25 +174,23 @@ void eth_try_write_all_queued(void) {
   memset(&dest_sa, 0, sizeof dest_sa);
   dest_sa.sll_ifindex = AF_PACKET;
   dest_sa.sll_ifindex = eth_ifindex;
-  if (very_verbose_log && send_log) {
-    logf(
-        "eth write queued frame, %lu bytes, dest mac=%s; "
-        "hdr tot_len=%lu, proto=%02X, sa=%s, ",
-        (unsigned long)eth_write_queue->len,
-        ether_ntoa((struct ether_addr const *)&eth_write_queue->hdr.h_dest),
-        (unsigned long)ntohs(eth_write_queue->ip.hdr.tot_len),
-        (int)eth_write_queue->ip.hdr.protocol,
-        inet_ntoa(ip_get_saddr(&eth_write_queue->ip)));
-    logf("da=%s\n", inet_ntoa(ip_get_daddr(&eth_write_queue->ip)));
-    hex_dump(stdlog, eth_write_queue->raw, eth_write_queue->len);
+  if (log_net_outbound) {
+    logf("eth: writing queued frame, tid %lu, %lu bytes, ");
   }
-  res = sendto(eth_socket, eth_write_queue, eth_write_queue->len, MSG_DONTWAIT,
-               (struct sockaddr *)&dest_sa, sizeof dest_sa);
+  res = sendto(eth_socket, eth_write_queue, eth_write_queue->x.len,
+               MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);
   if (res < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+      if (log_net_outbound) {
+        logf("send would block (waiting to retry)\n");
+      }
       return;
     }
-    perror("eth sendto() failed");
+    perror("sendto() failed");
+  } else {
+    if (log_net_outbound) {
+      logf("sent\n");
+    }
   }
   free_packet_buf(eth_write_queue);
   eth_write_queue = NULL;

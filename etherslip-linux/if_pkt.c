@@ -49,7 +49,9 @@ void pkt_read_available(void) {
   // at reading/processing a single packet
   struct eth_packet *frame = alloc_packet_buf();
   if (frame == NULL) {
-    logf("eth packet alloc failed!\n");
+    if (log_verbose) {
+      logf("pkt: packet alloc fail in pkt_read_available\n");
+    }
     return;
   }
 
@@ -74,7 +76,7 @@ void pkt_read_available(void) {
     memcpy(&frame->hdr.h_source, &broadcast_mac, sizeof(struct ether_addr));
     frame->hdr.h_proto = htons(ETH_P_IP);
 
-    frame->len = sizeof(struct ethhdr) + len;
+    frame->x.len = sizeof(struct ethhdr) + len;
     net_process_frame(frame);
   }
 }
@@ -87,11 +89,11 @@ bool pkt_send(struct eth_packet *frame) {
   }
 
   struct ip_packet *ip_frame = &frame->ip;
-  assert(ip_validate_packet(ip_frame, ip_len(frame)));
+  assert(ip_validate_packet(frame));
 
-  if (very_verbose_log && send_log) {
+  if (log_very_verbose && log_send) {
     logf("pkt_send packet:\n");
-    hex_dump(stdlog, &frame->ip, ntohs(frame->ip.hdr.tot_len));
+    hex_dump(stdlog, "pkt:   ", &frame->ip, ntohs(frame->ip.hdr.tot_len));
   }
 
   pkt_write_queue = frame;
@@ -112,18 +114,18 @@ void pkt_try_write_all_queued(void) {
   memcpy(&dest_sa.sin_addr, &pkt_write_queue->ip.hdr.daddr,
          sizeof dest_sa.sin_addr);
   dest_sa.sin_port = 0;
-  if (very_verbose_log && send_log) {
+  if (log_very_verbose && log_send) {
     logf(
         "pkt write queued frame, %lu bytes, dest mac=%s; "
         "hdr tot_len=%lu, proto=%02X, sa=%s, ",
-        (unsigned long)pkt_write_queue->len,
+        (unsigned long)pkt_write_queue->x.len,
         ether_ntoa((struct ether_addr const *)&pkt_write_queue->hdr.h_dest),
         (unsigned long)ntohs(pkt_write_queue->ip.hdr.tot_len),
         (int)pkt_write_queue->ip.hdr.protocol,
         inet_ntoa(ip_get_saddr(&pkt_write_queue->ip)));
     logf("da=%s\n", inet_ntoa(ip_get_daddr(&pkt_write_queue->ip)));
   }
-  res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->len,
+  res = sendto(pkt_send_socket, pkt_write_queue, pkt_write_queue->x.len,
                MSG_DONTWAIT, (struct sockaddr *)&dest_sa, sizeof dest_sa);
   if (res < 0) {
     if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
